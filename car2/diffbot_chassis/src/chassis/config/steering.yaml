@@ -1,0 +1,149 @@
+chassis:
+  ros__parameters:
+    # BXI PCI 总线：CAN0 四个 ISWV 转向轴；CAN1/2 四个 ISWV 行进轴。
+    can_bus: 0
+
+    # 底盘前后轮中心之间的距离，单位：米。
+    wheel_base_m: 0.42
+
+    # 底盘左右轮中心之间的距离（轮距），单位：米。
+    track_width_m: 0.36
+
+    # 舵轮目标角度的最大绝对值，单位：弧度。
+    # 3.141592653589793 = 180 度；如果机械结构不能转到 180 度，请改小。
+    max_steering_angle_rad: 3.141592653589793
+
+    # 校准中位时行进轮正方向指向车体右侧，因此将车体期望方向加 90 度后下发给转向轴。
+    # 如果实车转向正方向与当前假设相反，改为 -1.5707963267948966。
+    steering_forward_offset_rad: 1.5707963267948966
+
+    # 速度指令超时时间，单位：秒。
+    # 超时后保持当前舵轮角度，不再发送新的角度目标。
+    command_timeout_s: 0.5
+
+    # 仅由 steering_calibration 成功完成四轮校准后写为 true。
+    # 主控制节点在此值为 false 时拒绝使能行走轮。
+    steering_calibrated: false
+
+    # 行走轮与转向轮顺序相同：[前左、后左、后右、前右]。
+    # CAN1 上是节点 1/2，CAN2 上是节点 3/4。
+    drive_can_buses: [1, 1, 2, 2]
+    drive_node_ids: [1, 2, 3, 4]
+    drive_inverted: [false, false, true, true]
+    # ISWV manual_travel 默认值，独立于转向减速比；实车按机械配置确认。
+    drive_encoder_resolution: 65536
+    drive_gear_ratio: 10.0
+
+    # 0.6 m/s 前进同时叠加 0.4 rad/s 旋转时，最外侧轮约需 101 输出轴 RPM。
+    drive_max_output_rpm: 105.0
+    drive_acceleration_rpm_s: 60.0
+    drive_deceleration_rpm_s: 120.0
+    drive_steering_tolerance_rad: 0.1
+
+    # 连续转向时距离校准软限位至少保留的角度余量，单位：rad；0.0872664626 = 5 度。
+    # 必须大于 0 且小于 max_steering_angle_rad。
+    steering_limit_margin_rad: 0.0872664626
+
+    # 转向目标角速度限制，单位：rad/s；用于让转向切换更平滑。
+    steering_rate_limit_rad_s: 0.5
+
+    # 行进轮停止阈值，单位：rad；转向误差超过此值时行进轮输出降为 0。
+    # 必须大于 drive_steering_tolerance_rad 且不超过 pi/2。
+    drive_alignment_stop_rad: 0.5
+
+    # 遥控旋转速度变化率限制，单位：rad/s²；用于减小旋转方向切换冲击。
+    command_yaw_acceleration_rad_s2: 0.8
+
+    # 电机轴转速保护上限，超过即中止；不是搜索目标速度。
+    calibration_speed_rpm: 100.0
+
+    # 速度模式搜索目标：舵轮输出轴 rpm，2 rpm = 12 度/秒。
+    # 电机目标 rpm = 此值 * gear_ratio，必须小于 calibration_speed_rpm。
+    calibration_search_speed_rpm: 2.0
+
+    # 兼容旧力矩标定配置；当前速度标定不使用此值，也不把它当作力矩限制。
+    calibration_torque_percent: 10.0
+
+    # 估算输出力矩安全上限，达到时中止，不记录限位，单位：N·m。
+    calibration_torque_limit_nm: 10.0
+
+    # 估算输出力矩达到此阈值即记录限位；安全上限始终优先中止。
+    # 必须小于 calibration_torque_limit_nm。
+    calibration_contact_torque_nm: 1.0
+
+    # 第二个限位与第一个限位的最小角距离，单位：rad；默认 pi，即 180 度。
+    # 未达到此距离就再次达到接触力矩时，报告硬限位异常并停止校准。
+    calibration_min_limit_separation_rad: 3.141592653589793
+
+    # 到达实时中位时允许的编码器计数误差；不再参与限位检测。
+    calibration_position_epsilon_inc: 64
+
+    # 兼容旧配置；当前力矩达到阈值即判定限位，不再等待停滞。
+    calibration_stall_time_s: 0.0
+
+    # 兼容旧配置；仅在缺少 calibration_contact_torque_nm 时换算为检测力矩。
+    calibration_current_threshold_a: 0.05
+    # 兼容旧配置；当前限位判据改为估算输出力矩阈值，不再使用该参数。
+    calibration_current_rise_a: 1.5
+
+    # 单方向搜索超时，超时发送零速度并退出，单位：秒。
+    # 按实际机械行程调整，不能取消超时。
+    calibration_timeout_s: 230.0
+
+    # 旧配置兼容字段；当前转向电机按 [1,2]、[3,4] 两组依次校准。
+    calibration_node_id: 1
+
+    # 校准必须为 false；任何驱动器故障均中止。
+    calibration_ignore_drive_fault: false
+
+    # 转向电机最大电流，单位：Arms。手册中 iGMH06809-00627 为 14.3 Arms。
+    # 用于把 0x6078 的原始实际电流换算为安培。
+    motor_peak_current_a: 14.3
+
+    # 转向电机力矩常数，单位：N·m/Arms。
+    # 当前按手册额定力矩 0.75 N·m / 额定电流 6.5 A 估算。
+    motor_torque_constant_nm_per_a: 0.1153846154
+
+    # ==================== 电机参数 ====================
+    # 编码器每转的计数分辨率，需与电机驱动器设置一致。
+    encoder_resolution: 65536
+
+    # 电机轴到舵轮输出轴的减速比。
+    # 该值应根据实际齿轮/同步带传动比校准，不能只凭估计。
+    gear_ratio: 9.0252707581
+
+    # 行进车轮直径，单位：米，用于整车线速度与输出轴 RPM 换算。
+    wheel_diameter_m: 0.130
+
+    # 转向位置模式的最大运行速度，单位：电机 rpm。
+    profile_velocity_rpm: 200.0
+
+    # 转向位置模式的加速度，单位：rps²（每秒转数每秒的变化量）。
+    acceleration_rps2: 100.0
+
+    # 转向位置模式的减速度，单位：rps²。
+    deceleration_rps2: 100.0
+
+    # RPDO/TPDO 的传输类型，通常保持驱动器默认值 254。
+    rpdo_transmission_type: 254
+    tpdo_transmission_type: 254
+
+    # TPDO 抑制时间，单位：0.1 ms；通常为 0。
+    tpdo_inhibit_time: 0
+
+    # TPDO 周期事件定时器，单位：毫秒。
+    tpdo_event_timer_ms: 10
+
+    # 四个电机的 Node-ID 顺序固定为：
+    # [0] 前左、[1] 后左、[2] 后右、[3] 前右。
+    # 四个 ID 必须互不相同，且范围为 1~127。
+    node_ids: [1, 2, 3, 4]
+
+    # 每个转向电机的方向是否反转，顺序为 [前左、后左、后右、前右]。
+    # 实车四个转向电机方向均与控制坐标相反，因此全部设为 true。
+    inverted: [true, true, true, true]
+
+    # 校准程序写入本次两侧限位算出的中位，单位：编码器计数。
+    # 主程序每次启动重新校准；随后位置控制使用这些中位。
+    # 数组顺序与 node_ids 完全一致。
+    zero_offset_inc: [0, 0, 0, 0]

@@ -1,0 +1,14 @@
+CompileFlags:
+  CompilationDatabase: build
+
+---
+If:
+  PathMatch: "(include/iswv/transports/zqwl_transport\\.hpp|src/transports/zqwl_transport\\.cpp|examples/zqwl.*\\.cpp)"
+CompileFlags:
+  CompilationDatabase: build-zqwl
+
+---
+If:
+  PathMatch: "(include/iswv/transports/ros2_transport\\.hpp|src/transports/ros2_transport\\.cpp|examples/ros2_node\\.cpp)"
+CompileFlags:
+  CompilationDatabase: build-ros2

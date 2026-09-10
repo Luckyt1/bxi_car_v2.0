@@ -1,0 +1,40 @@
+# Local builds and ROS 2 workspace output
+build/
+build-*/
+install/
+log/
+logs/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+install_manifest.txt
+symlink_install_manifest.txt
+
+# Object files; vendor static libraries under car2 are required inputs
+*.o
+*.obj
+*.pyc
+__pycache__/
+
+# Editor caches and local agent state
+.vscode/
+.idea/
+.cache/
+.omx/
+.agents/
+.codex/
+.wiki/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
