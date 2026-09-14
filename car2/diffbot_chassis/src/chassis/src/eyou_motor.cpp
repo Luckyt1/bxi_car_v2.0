@@ -1,11 +1,10 @@
-#include "chassis/eyou_motor.hpp"
+#include "chassis/motor/eyou_motor.hpp"
 
 #include <chrono>
 #include <cmath>
 #include <exception>
 #include <iomanip>
 #include <limits>
-#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -16,6 +15,7 @@ namespace
 {
 using namespace std::chrono_literals;
 using iswv::canopen::Object;
+
 constexpr Object<std::int8_t> mode_display{{0x6061, 0}, "mode display"};
 constexpr Object<std::int32_t> target_velocity{{0x60FF, 0}, "target velocity"};
 constexpr Object<std::int32_t> velocity_actual{{0x606C, 0}, "actual velocity"};
@@ -50,7 +50,7 @@ EyouMotor::~EyouMotor()
   try {
     stop();
   } catch (...) {
-  }                             // Explicit stop() reports failures to the caller.
+  }  // 显式 stop() 会把失败报告给调用者；析构只尽力停车。
 }
 
 double EyouMotor::configure_rpm_units()
@@ -118,8 +118,7 @@ void EyouMotor::enable(std::uint32_t acceleration, std::uint32_t deceleration)
     throw std::invalid_argument("acceleration and deceleration must be positive (pulse/s^2)");
   }
   if (active_) {throw std::logic_error("stop the motor before reconfiguring");}
-  // yy.pdf p.183: 0=UART, 1=EtherCAT (factory default), 2=CANopen.
-  // Obtain and verify CANopen authority before attempting motion-object writes.
+  // 切到 CANopen 控制源后才允许写运动对象，避免串口/ EtherCAT 权限下误动作。
   const auto source = node_->read(control_source);
   check(source, "read control source 0x2100");
   if (source.value() != 2) {
@@ -143,10 +142,9 @@ void EyouMotor::enable(std::uint32_t acceleration, std::uint32_t deceleration)
       throw std::runtime_error("0x2100 did not confirm CANopen control; no motion command sent");
     }
   }
-  active_ = true;  // Also clean up partially completed initialization.
+  active_ = true;  // 初始化中途失败也由 stop() 清理。
   try {
     check(node_->send_nmt(iswv::canopen::NmtCommand::enter_pre_operational), "NMT pre-op");
-    // Remove any previous enable and stale velocity before changing mode.
     check(drive_.write_control(0), "disable voltage");
     check(
       drive_.wait_for_status(
@@ -156,7 +154,6 @@ void EyouMotor::enable(std::uint32_t acceleration, std::uint32_t deceleration)
         }, 1000ms), "wait for disabled state (check fault/STO if timeout)");
     check(node_->write(target_velocity, 0), "clear 0x60FF");
     check(drive_.set_mode(iswv::cia402::OperationMode::profile_velocity), "set PV mode");
-    // An SDO write acknowledgement can precede the firmware's mode change.
     const auto mode_deadline = std::chrono::steady_clock::now() + 1s;
     while (true) {
       const auto mode = node_->read(mode_display);
@@ -249,157 +246,6 @@ std::string EyouMotor::diagnostic_report()
   return report.str();
 }
 
-std::string EyouMotor::information_report(bool * complete)
-{
-  bool all_ok = true;
-  bool scale_ok = false;
-  std::int32_t encoder = 0;
-  std::uint16_t numerator = 0;
-  std::uint16_t denominator = 0;
-  double pulses_per_output_revolution = 0;
-  std::ostringstream report;
-  report << "INFO node=" << static_cast<unsigned>(node_->id()) << '\n';
-
-  const auto append_error = [&report](const auto & result) {
-      report << "READ FAILED: " << result.error().message;
-      if (result.error().sdo_abort_code) {
-        report << " (SDO abort 0x" << std::hex << std::setfill('0') << std::setw(8)
-               << *result.error().sdo_abort_code << std::dec << ")";
-      }
-      report << '\n';
-    };
-
-  const auto read_object = [this, &report, &append_error, &all_ok](auto object, auto print_value) {
-      report << "  0x" << std::hex << std::setfill('0') << std::setw(4)
-             << object.address.index << ":00 " << object.name << " = " << std::dec;
-      const auto result = node_->read(object);
-      if (!result) {
-        all_ok = false;
-        append_error(result);
-        return false;
-      }
-      print_value(result.value());
-      report << '\n' << std::dec;
-      return true;
-    };
-
-  read_object(
-    iswv::cia402::status_word,
-    [&report](std::uint16_t value) {
-      report << "0x" << std::hex << std::setfill('0') << std::setw(4) << value
-             << " (" << iswv::cia402::state_name(iswv::cia402::decode_state(value)) << ")";
-    });
-  read_object(
-    Object<std::uint16_t>{{0x603F, 0}, "error code"},
-    [&report](std::uint16_t value) {
-      report << "0x" << std::hex << std::setfill('0') << std::setw(4) << value;
-    });
-  read_object(mode_display, [&report](std::int8_t value) {report << static_cast<int>(value);});
-  read_object(
-    control_source,
-    [&report](std::uint8_t value) {
-      const char * source_name = value == 0 ? "UART" :
-      (value == 1 ? "EtherCAT" : (value == 2 ? "CANopen" : "unknown"));
-      report << static_cast<unsigned>(value) << " (" << source_name << ")";
-    });
-
-  const bool encoder_ok = read_object(
-    encoder_resolution,
-    [&report, &encoder](std::int32_t value) {encoder = value; report << value;});
-  const bool numerator_ok = read_object(
-    gear_numerator,
-    [&report, &numerator](std::uint16_t value) {numerator = value; report << value;});
-  const bool denominator_ok = read_object(
-    gear_denominator,
-    [&report, &denominator](std::uint16_t value) {denominator = value; report << value;});
-
-  if (encoder_ok && numerator_ok && denominator_ok && encoder > 0 && numerator != 0 &&
-    denominator != 0)
-  {
-    pulses_per_output_revolution = static_cast<double>(encoder) * numerator / denominator;
-    scale_ok = true;
-    report << "  output scale = " << std::fixed << std::setprecision(3)
-           << pulses_per_output_revolution << " pulse/revolution\n";
-  } else {
-    all_ok = false;
-    report << "  output RPM unavailable: invalid encoder resolution/reduction ratio\n";
-  }
-
-  const auto print_speed = [&report, scale_ok, pulses_per_output_revolution](std::int32_t value) {
-      report << value << " pulse/s";
-      if (scale_ok) {
-        report << " (" << std::fixed << std::setprecision(3)
-               << static_cast<double>(value) * 60.0 / pulses_per_output_revolution
-               << " output RPM)";
-      }
-    };
-  read_object(target_velocity, print_speed);
-  read_object(velocity_actual, print_speed);
-
-  if (complete) {*complete = all_ok;}
-  return report.str();
-}
-
-std::string EyouMotor::electrical_report(bool * complete)
-{
-  const auto read = [this](auto object, std::string & error) -> std::optional<double> {
-      const auto result = node_->read(object, iswv::canopen::SdoOptions{50ms});
-      if (result) {return static_cast<double>(result.value());}
-      std::ostringstream reason;
-      reason << "0x" << std::hex << object.address.index << ": " << result.error().message;
-      if (result.error().sdo_abort_code) {
-        reason << " (SDO abort 0x" << std::setfill('0') << std::setw(8)
-               << *result.error().sdo_abort_code << ")";
-      }
-      if (!error.empty()) {error += "; ";}
-      error += reason.str();
-      return std::nullopt;
-    };
-
-  std::string voltage_error, current_error, torque_error, temperature_error, power_error,
-    force_error;
-  const auto voltage = read(Object<std::uint32_t>{{0x6079, 0}, "bus voltage"}, voltage_error);
-  const auto rated_current = read(
-    Object<std::uint32_t>{{0x6075, 0}, "rated current"}, current_error);
-  const auto current = read(Object<std::int16_t>{{0x6078, 0}, "actual current"}, current_error);
-  const auto rated_torque = read(Object<std::uint32_t>{{0x6076, 0}, "rated torque"}, torque_error);
-  const auto torque = read(Object<std::int16_t>{{0x6077, 0}, "actual torque"}, torque_error);
-  const auto temperature = read(
-    Object<std::int32_t>{{0x2779, 0}, "internal temperature"}, temperature_error);
-  const auto power_temperature = read(
-    Object<std::int32_t>{{0x277A, 0}, "power temperature"}, power_error);
-  const auto force_torque = read(Object<std::int32_t>{{0x27BD, 0}, "force torque"}, force_error);
-  if (rated_current && *rated_current == 0) {current_error += "额定电流为零";}
-  if (rated_torque && *rated_torque == 0) {torque_error += "额定力矩为零";}
-
-  bool all_ok = true;
-  std::ostringstream report;
-  report << std::fixed << std::setprecision(3);
-  const auto append = [&report, &all_ok](
-    const char * label, double value, const char * unit, const std::string & error) {
-      report << label << ": ";
-      if (error.empty()) {
-        report << value << ' ' << unit;
-      } else {
-        all_ok = false;
-        report << "不可用(" << error << ")";
-      }
-    };
-  append("电压", voltage.value_or(0) / 1000.0, "V", voltage_error);
-  report << "  ";
-  append("电流", current.value_or(0) * rated_current.value_or(0) / 1e6, "A", current_error);
-  report << "  ";
-  append("电机力矩", torque.value_or(0) * rated_torque.value_or(0) / 1e6, "Nm", torque_error);
-  report << "  ";
-  append("内部温度", temperature.value_or(0), "C", temperature_error);
-  report << "  ";
-  append("功率温度", power_temperature.value_or(0), "C", power_error);
-  report << "  ";
-  append("力控力矩", force_torque.value_or(0), "Nm", force_error);
-  if (complete) {*complete = all_ok;}
-  return report.str();
-}
-
 void EyouMotor::stop()
 {
   if (!active_) {return;}
@@ -421,7 +267,7 @@ void EyouMotor::stop()
   } catch (...) {
     failure = std::current_exception();
   }
-  // Always attempt disable, even when the zero-speed command/read failed.
+  // 即使零速命令或反馈读取失败，也要继续尝试下电。
   enabled_ = false;
   check(drive_.write_control(0), "stop: disable voltage");
   check(
@@ -432,4 +278,5 @@ void EyouMotor::stop()
   active_ = false;
   if (failure) {std::rethrow_exception(failure);}
 }
+
 }  // namespace chassis

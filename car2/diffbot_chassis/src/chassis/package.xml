@@ -3,7 +3,7 @@
 <package format="3">
   <name>chassis</name>
   <version>0.0.0</version>
-  <description>ISWV four-wheel steering chassis controller and independent upper equipment motor tools.</description>
+  <description>Swerve chassis controller with remote control, ISWV, Eyou and BXI motor libraries.</description>
   <maintainer email="lyy@todo.todo">lyy</maintainer>
   <license>Apache-2.0</license>
 

@@ -111,7 +111,7 @@ sudo -E ./diffbot_chassis/install/chassis/lib/chassis/drive_wheel_test \
 
 独立程序 `steering_direction_test` 只点动所选转向轴，不搜索机械限位，也不自动回中。它要求 YAML 已有有效校准（`steering_calibrated: true` 和对应 `zero_offset_inc`），且当前编码器位置距保存中位不超过 10°。仓库模板默认未校准，不能仅手动改为 `true` 来跳过标定。
 
-需要先标定时运行以下命令；**这一步会依次校准全部四个转向轴并保持中位**，不是单电机操作。校准完成后按 Ctrl+C 退出，再运行点动工具：
+需要先标定时运行以下命令；**这一步会同时启动四个转向轴校准并保持中位**，不是单电机操作。每个轴碰到负限位后立即反向搜索正限位，正限位确认后独立回中，已完成的轴保持中位等待其余轴。校准完成后按 Ctrl+C 退出，再运行点动工具：
 
 ```bash
 sudo -E bash start_steering_calibration.sh
@@ -131,7 +131,7 @@ sudo -E ./diffbot_chassis/install/chassis/lib/chassis/steering_direction_test \
 
 参数为 `CONFIG WHEEL DELTA_DEG`；角度带符号、非零且绝对值不超过 3°，方向沿用转向 `inverted` 配置。点动速度为输出轴 0.2 RPM，到达目标后停机、失能并断电，不自动返回起点，不改写配置。位置检查不通过时应重新确认/校准中位；裸电机若没有有效校准，需按下文 API 接入。
 
-`start_steering_direction_test.sh` 是另一套方向确认流程：先两两校准四轴，再逐轮以 2 输出轴 RPM 点动 +50° 并记录人工观察。它不接受轮号参数，不能替代上述单轴小角度命令，详见 [方向确认说明](car2/diffbot_chassis/README.md)。
+`start_steering_direction_test.sh` 是另一套方向确认流程：先四轴一起校准并回中，再逐轮以 2 输出轴 RPM 点动 +50° 并记录人工观察。它不接受轮号参数，不能替代上述单轴小角度命令，详见 [方向确认说明](car2/diffbot_chassis/README.md)。
 
 ### 3. 意优上装电机：读取信息、定时或持续试转
 

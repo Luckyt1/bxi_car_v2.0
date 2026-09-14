@@ -39,13 +39,10 @@ int main(int argc, char ** argv)
     if (!std::isfinite(rpm) || rpm < 0.0 || rpm > config.drive_max_output_rpm) {
       throw std::invalid_argument("RPM must be in [0, drive_max_output_rpm]");
     }
-    config.steering_calibrated = false;
-    chassis::save_steering_config(argv[1], config);
     chassis::ChassisController chassis(config);
     auto keep_running = [] {return running != 0;};
     chassis.initialize(keep_running);
     chassis.calibrate(keep_running);
-    chassis::save_steering_config(argv[1], chassis.config());
     if (running && rpm > 0.0) {chassis.forward(rpm);}
     while (running) {
       // The application can call set_velocity(x, y, yaw) or stop() here for its next operation.

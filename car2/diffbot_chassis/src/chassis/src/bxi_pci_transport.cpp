@@ -89,6 +89,11 @@ iswv::Result<void> BxiPciTransport::send(const iswv::CanFrame & frame)
   }
   auto value = packet.take_value();
   if (trace_) {trace_frame("TX-attempt", bus_, frame);}
+  // All CAN buses enqueue into the vendor's shared g_fifo_tx. Its kfifo
+  // producer path is not locked, so serialize callers across every transport.
+  // Keep this separate from registry_mutex_: receive callbacks use that lock.
+  static std::mutex enqueue_mutex;
+  std::lock_guard<std::mutex> lock(enqueue_mutex);
   if (canfd_send_packet(&value, 1) < 0) {
     return iswv::Result<void>::failure(
       iswv::ErrorCode::transport_error, "BXI PCI CAN send failed");

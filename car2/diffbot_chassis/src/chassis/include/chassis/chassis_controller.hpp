@@ -6,6 +6,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <string>
 
 namespace chassis
 {
@@ -31,14 +32,17 @@ public:
 
   // Starts CAN0/1/2 and inhibits travel axes before any calibration movement.
   void initialize(const std::function<bool()> & keep_running = [] {return true;});
-  // Calibrates steering axes in two pairs, confirms midpoints, then enables travel axes.
+  // Calibrates all four steering axes, confirms midpoints, then enables travel axes.
   void calibrate(const std::function<bool()> & keep_running = [] {return true;});
   // Explicit continuous forward state, superseded by set_velocity() or stop().
   void forward(double output_rpm = 0.5);
-  // SI units: m/s, m/s, rad/s. Commands expire after command_timeout_s.
+  // SI units: m/s, m/s, rad/s. Holds the command until replaced, stopped or faulted.
   void set_velocity(double x, double y, double yaw);
   void update();
+  // Sends zero without waiting for standstill; keep calling update() to monitor feedback.
   void stop();
+  // Consumes the latest one-second zero-command feedback report; no CAN reads.
+  std::string take_stop_diagnostic();
   State state() const noexcept;
   const SteeringConfigFile & config() const noexcept;
 
