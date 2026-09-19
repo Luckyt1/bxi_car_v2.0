@@ -41,9 +41,29 @@ float decode(std::uint32_t value, const Range & range, unsigned bits)
     static_cast<float>(maximum) + range.min;
   if (std::isfinite(decoded)) {return decoded;}
   return static_cast<float>(static_cast<double>(value) *
-    (static_cast<double>(range.max) - range.min) / maximum + range.min);
+         (static_cast<double>(range.max) - range.min) / maximum + range.min);
 }
 }  // namespace
+
+EncodingRanges encoding_ranges(Model model)
+{
+  // https://wiki.bxirobotics.cn/actuators/can_communication/ (2026-09-15)
+  // 协议量化范围独立于机械额定/峰值扭矩，不用减速比再次缩放。
+  EncodingRanges ranges;
+  switch (model) {
+    case Model::BXI5014_19:  // MOTOR_50
+    case Model::BXI5018_19:  // MOTOR_50_L
+      return ranges;
+    case Model::BXI7010_19:  // MOTOR_70
+      ranges.torque = {-80.0F, 80.0F};
+      return ranges;
+    case Model::BXI8515_19:  // MOTOR_85
+      ranges.kd = {0.0F, 20.0F};
+      ranges.torque = {-160.0F, 160.0F};
+      return ranges;
+  }
+  throw std::invalid_argument("unknown BXI motor model");
+}
 
 iswv::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
 {
@@ -55,7 +75,8 @@ iswv::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
     !in_range(command.kd, ranges.kd) ||
     !in_range(command.torque, ranges.torque))
   {
-    return Result::failure(iswv::ErrorCode::invalid_argument,
+    return Result::failure(
+      iswv::ErrorCode::invalid_argument,
       "BXI MIT command requires finite ordered encoding ranges and finite values within them");
   }
   const auto p = encode(command.position, ranges.position, 16);
@@ -70,12 +91,14 @@ iswv::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
     static_cast<std::uint8_t>(kp & 0xffU), static_cast<std::uint8_t>(kd >> 4),
     static_cast<std::uint8_t>(((kd & 0xfU) << 4) | (t >> 8)),
     static_cast<std::uint8_t>(t & 0xffU)};
-  if (std::all_of(payload.begin(), payload.begin() + 7,
-    [](std::uint8_t byte) {return byte == 0xff;}) &&
-    (payload[7] == 0xfc || payload[7] == 0xfd))
+  if (std::all_of(
+      payload.begin(), payload.begin() + 7,
+      [](std::uint8_t byte) {return byte == 0xff;}) &&
+    (payload[7] >= 0xfa && payload[7] <= 0xfe))
   {
-    return Result::failure(iswv::ErrorCode::invalid_argument,
-      "BXI MIT command collides with an enter/exit mode frame");
+    return Result::failure(
+      iswv::ErrorCode::invalid_argument,
+      "BXI MIT command collides with a special control frame (0xFA..0xFE)");
   }
   return Result::success(payload);
 }
@@ -85,11 +108,13 @@ iswv::Result<Feedback> decode_feedback(const iswv::CanFrame & frame, const Encod
   if (!iswv::valid_frame(frame) || frame.extended || frame.remote || frame.error ||
     frame.size < 5)
   {
-    return iswv::Result<Feedback>::failure(iswv::ErrorCode::protocol_error,
+    return iswv::Result<Feedback>::failure(
+      iswv::ErrorCode::protocol_error,
       "BXI feedback requires a valid standard data frame of at least five bytes");
   }
   if (!valid_range(ranges.position) || !valid_range(ranges.velocity)) {
-    return iswv::Result<Feedback>::failure(iswv::ErrorCode::invalid_argument,
+    return iswv::Result<Feedback>::failure(
+      iswv::ErrorCode::invalid_argument,
       "BXI feedback requires finite ordered position and velocity encoding ranges");
   }
   const auto p = (static_cast<std::uint32_t>(frame.data[1]) << 8) | frame.data[2];
@@ -125,6 +150,11 @@ iswv::Result<void> Motor::enter_motor_mode()
 iswv::Result<void> Motor::exit_motor_mode()
 {
   return send({0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd});
+}
+
+iswv::Result<void> Motor::save_zero_position()
+{
+  return send({0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe});
 }
 
 iswv::Result<void> Motor::command(const Command & command)

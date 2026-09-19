@@ -38,4 +38,14 @@ int main()
   bxi::Motor different_id(transport, 2);
   assert(different_id.exit_motor_mode());
   assert(transport.sent_frames().back().id == 2);
+  transport.clear_sent();
+  assert(different_id.save_zero_position());
+  const auto zero_frame = transport.sent_frames().back();
+  assert(zero_frame.id == 2 && zero_frame.size == 8 && zero_frame.fd && zero_frame.bitrate_switch);
+  for (unsigned i = 0; i < 7; ++i) {assert(zero_frame.data[i] == 0xff);}
+  assert(zero_frame.data[7] == 0xfe);
+  transport.close();
+  const auto failed_zero = different_id.save_zero_position();
+  assert(!failed_zero && failed_zero.error().code == iswv::ErrorCode::transport_closed);
+  assert(transport.sent_frames().size() == 1);
 }

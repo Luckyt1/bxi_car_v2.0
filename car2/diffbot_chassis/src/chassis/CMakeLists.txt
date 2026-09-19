@@ -10,6 +10,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(yaml_cpp_vendor REQUIRED)
 find_package(yaml-cpp REQUIRED)
@@ -65,6 +66,9 @@ target_include_directories(chassis_bxi_motor PUBLIC
 target_compile_features(chassis_bxi_motor PUBLIC cxx_std_17)
 target_link_libraries(chassis_bxi_motor PUBLIC iswv::canopen)
 
+add_library(chassis_bxi_can3 STATIC src/bxi_can3.cpp)
+target_link_libraries(chassis_bxi_can3 PUBLIC chassis_bxi_motor chassis_bxi_transport)
+
 add_library(chassis_controller STATIC src/chassis_controller.cpp)
 target_include_directories(chassis_controller PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:include>)
@@ -72,20 +76,32 @@ target_compile_features(chassis_controller PUBLIC cxx_std_17)
 target_link_libraries(chassis_controller PUBLIC
   chassis_iswv_motor chassis_bxi_transport)
 add_executable(chassis_main examples/chassis_main.cpp)
-target_link_libraries(chassis_main PRIVATE chassis_controller)
+target_link_libraries(chassis_main PRIVATE chassis_controller chassis_bxi_can3)
 
 add_executable(motor_power_hold src/motor_power_hold.cpp)
 target_link_libraries(motor_power_hold PRIVATE chassis_bxi_transport)
 
 add_executable(key_control src/control.cpp)
 target_include_directories(key_control PRIVATE include)
-ament_target_dependencies(key_control PUBLIC rclcpp geometry_msgs)
+ament_target_dependencies(key_control PUBLIC rclcpp rcl_interfaces geometry_msgs)
 
-target_link_libraries(chassis PRIVATE chassis_controller)
+target_link_libraries(chassis PRIVATE chassis_controller chassis_bxi_can3)
 
-ament_target_dependencies(chassis PUBLIC rclcpp geometry_msgs)
+ament_target_dependencies(chassis PUBLIC rclcpp rcl_interfaces geometry_msgs)
 
 if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_executable(test_bxi_can3 tests/test_bxi_can3.cpp)
+  target_link_libraries(test_bxi_can3 PRIVATE chassis_bxi_can3)
+  add_test(NAME bxi_can3 COMMAND test_bxi_can3)
+  set_tests_properties(bxi_can3 PROPERTIES TIMEOUT 10)
+  add_test(NAME can3_terminal
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s ${CMAKE_CURRENT_SOURCE_DIR}/tests -p test_can3_control.py)
+  set_tests_properties(can3_terminal PROPERTIES TIMEOUT 10)
+  add_executable(test_can3_joystick tests/test_can3_joystick.cpp)
+  target_include_directories(test_can3_joystick PRIVATE include)
+  add_test(NAME can3_joystick COMMAND test_can3_joystick)
   # CLI checks use the application targets and do not require separate test sources.
   add_test(NAME chassis_main_help COMMAND chassis_main --help)
   add_test(NAME motor_power_hold_help COMMAND motor_power_hold --help)
@@ -99,9 +115,10 @@ install(TARGETS
   motor_power_hold
   key_control
   DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS scripts/can3_control.py DESTINATION lib/${PROJECT_NAME})
 
 install(TARGETS chassis_controller chassis_iswv_motor chassis_eyou_motor
-  chassis_bxi_motor chassis_bxi_transport
+  chassis_bxi_motor chassis_bxi_transport chassis_bxi_can3
   EXPORT chassisControlTargets
   ARCHIVE DESTINATION lib)
 install(DIRECTORY include/chassis DESTINATION include)

@@ -419,8 +419,10 @@ void custom_ranges_encode_all_fields_and_are_local_to_each_command()
   command.kd = 10.0F;
   command.torque = 120.0F;
   const auto maximum = bxi::pack_command(command);
-  assert(maximum && same_bytes(maximum.value(),
-    {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}));
+  assert(
+    maximum && same_bytes(
+      maximum.value(),
+      {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}));
 }
 
 void invalid_custom_ranges_and_values_never_send()
@@ -434,8 +436,8 @@ void invalid_custom_ranges_and_values_never_send()
   const float inf = std::numeric_limits<float>::infinity();
   for (auto field : fields) {
     for (const auto range : {bxi::Range{0, 0}, bxi::Range{1, -1},
-      bxi::Range{nan, 1}, bxi::Range{-1, nan}, bxi::Range{-inf, 1},
-      bxi::Range{-1, inf}, bxi::Range{1, 2}, bxi::Range{-2, -1}})
+        bxi::Range{nan, 1}, bxi::Range{-1, nan}, bxi::Range{-inf, 1},
+        bxi::Range{-1, inf}, bxi::Range{1, 2}, bxi::Range{-2, -1}})
     {
       bxi::Command command;
       command.ranges.*field = range;
@@ -479,8 +481,8 @@ void feedback_uses_custom_ranges_and_rejects_invalid_ranges()
 
   for (auto field : {&bxi::EncodingRanges::position, &bxi::EncodingRanges::velocity}) {
     for (const auto range : {bxi::Range{1, 1}, bxi::Range{1, -1},
-      bxi::Range{std::numeric_limits<float>::quiet_NaN(), 1},
-      bxi::Range{-1, std::numeric_limits<float>::infinity()}})
+        bxi::Range{std::numeric_limits<float>::quiet_NaN(), 1},
+        bxi::Range{-1, std::numeric_limits<float>::infinity()}})
     {
       auto invalid = ranges;
       invalid.*field = range;
@@ -508,6 +510,77 @@ void large_finite_ranges_do_not_overflow_encoding_or_feedback()
   frame.data[4] = 0xf0;
   const auto maximum = bxi::decode_feedback(frame, command.ranges);
   assert(maximum && maximum.value().position == largest && maximum.value().velocity == largest);
+}
+
+void official_model_ranges_control_encoding_and_feedback()
+{
+  const std::array<bxi::Model, 4> models{
+    bxi::Model::BXI5014_19, bxi::Model::BXI5018_19,
+    bxi::Model::BXI7010_19, bxi::Model::BXI8515_19};
+  const std::array<float, 4> torque_max{40, 40, 80, 160};
+  const std::array<float, 4> kd_max{5, 5, 5, 20};
+  // At torque=40 Nm and Kd=5, different model scales yield different wire values.
+  const std::array<unsigned, 4> torque_raw{4095, 4095, 3071, 2559};
+  const std::array<unsigned, 4> kd_raw{4095, 4095, 4095, 1023};
+  iswv::FakeTransport transport;
+  bxi::Motor motor(transport, 1);
+  for (std::size_t i = 0; i < models.size(); ++i) {
+    auto ranges = bxi::encoding_ranges(models[i]);
+    assert(ranges.position.min == -12.5F && ranges.position.max == 12.5F);
+    assert(ranges.velocity.min == -45 && ranges.velocity.max == 45);
+    assert(ranges.kp.min == 0 && ranges.kp.max == 500);
+    assert(ranges.kd.min == 0 && ranges.kd.max == kd_max[i]);
+    assert(ranges.torque.min == -torque_max[i] && ranges.torque.max == torque_max[i]);
+    bxi::Command command{0, 0, 0, 5, 40, ranges};
+    assert(motor.command(command));
+    const auto data = transport.sent_frames().back().data;
+    assert(((static_cast<unsigned>(data[5]) << 4) | (data[6] >> 4)) == kd_raw[i]);
+    assert((((data[6] & 0x0FU) << 8) | data[7]) == torque_raw[i]);
+    for (const float sign : {-1.0F, 1.0F}) {
+      command.torque = sign * torque_max[i];
+      assert(bxi::pack_command(command));
+      command.torque = sign * (torque_max[i] + 1);
+      const auto before = transport.sent_frames().size();
+      assert_invalid_argument(motor.command(command));
+      assert(transport.sent_frames().size() == before);
+    }
+    command.torque = 0;
+    command.kd = kd_max[i] + 1;
+    assert_invalid_argument(motor.command(command));
+    auto frame = valid_feedback_frame();
+    const auto feedback = bxi::decode_feedback(frame, ranges);
+    assert(feedback && feedback.value().position == -12.5F && feedback.value().velocity == -45);
+    // Runtime overrides remain local and do not mutate model defaults.
+    ranges.velocity = {-60, 60};
+    const auto custom = bxi::decode_feedback(frame, ranges);
+    assert(custom && custom.value().velocity == -60);
+    assert(bxi::encoding_ranges(models[i]).velocity.max == 45);
+  }
+  bool rejected = false;
+  try {
+    bxi::encoding_ranges(static_cast<bxi::Model>(99));
+  } catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  assert(rejected);
+}
+
+void rejects_all_documented_special_frames_without_sending()
+{
+  iswv::FakeTransport transport;
+  bxi::Motor motor(transport, 1);
+  // Identity scales make each target payload exact, independent of float rounding.
+  bxi::Command command{65535, 4095, 4095, 4095, 4090};
+  command.ranges = {{0, 65535}, {0, 4095}, {0, 4095}, {0, 4095}, {0, 4095}};
+  for (unsigned last_byte = 0xfa; last_byte <= 0xfe; ++last_byte) {
+    command.torque = static_cast<float>(0xf00U | last_byte);
+    assert_invalid_argument(motor.command(command));
+  }
+  assert(transport.sent_frames().empty());
+  command.torque = 4089;  // 0xF9 remains an ordinary payload.
+  assert(bxi::pack_command(command));
+  command.torque = 4095;  // 0xFF remains an ordinary payload.
+  assert(bxi::pack_command(command));
 }
 
 }  // namespace
@@ -543,4 +616,6 @@ int main()
   custom_ranges_preserve_mode_collision_rejection();
   feedback_uses_custom_ranges_and_rejects_invalid_ranges();
   large_finite_ranges_do_not_overflow_encoding_or_feedback();
+  official_model_ranges_control_encoding_and_feedback();
+  rejects_all_documented_special_frames_without_sending();
 }

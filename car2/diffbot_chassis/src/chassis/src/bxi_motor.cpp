@@ -46,6 +46,26 @@ float decode(std::uint32_t value, const Range & range, unsigned bits)
 }
 }  // namespace
 
+EncodingRanges encoding_ranges(Model model)
+{
+  // https://wiki.bxirobotics.cn/actuators/can_communication/ (2026-09-15)
+  // 协议量化范围独立于机械额定/峰值扭矩，不用减速比再次缩放。
+  EncodingRanges ranges;
+  switch (model) {
+    case Model::BXI5014_19:  // MOTOR_50
+    case Model::BXI5018_19:  // MOTOR_50_L
+      return ranges;
+    case Model::BXI7010_19:  // MOTOR_70
+      ranges.torque = {-80.0F, 80.0F};
+      return ranges;
+    case Model::BXI8515_19:  // MOTOR_85
+      ranges.kd = {0.0F, 20.0F};
+      ranges.torque = {-160.0F, 160.0F};
+      return ranges;
+  }
+  throw std::invalid_argument("unknown BXI motor model");
+}
+
 iswv::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
 {
   using Result = iswv::Result<std::array<std::uint8_t, 8>>;
@@ -75,11 +95,11 @@ iswv::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
   if (std::all_of(
       payload.begin(), payload.begin() + 7,
       [](std::uint8_t byte) {return byte == 0xff;}) &&
-    (payload[7] == 0xfc || payload[7] == 0xfd))
+    (payload[7] >= 0xfa && payload[7] <= 0xfe))
   {
     return Result::failure(
       iswv::ErrorCode::invalid_argument,
-      "BXI MIT command collides with an enter/exit mode frame");
+      "BXI MIT command collides with a special control frame (0xFA..0xFE)");
   }
   return Result::success(payload);
 }
@@ -131,6 +151,11 @@ iswv::Result<void> Motor::enter_motor_mode()
 iswv::Result<void> Motor::exit_motor_mode()
 {
   return send({0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd});
+}
+
+iswv::Result<void> Motor::save_zero_position()
+{
+  return send({0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe});
 }
 
 iswv::Result<void> Motor::command(const Command & command)

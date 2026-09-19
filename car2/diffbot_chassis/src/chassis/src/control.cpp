@@ -8,8 +8,10 @@
 #include <cstring>
 #include <fcntl.h>
 #include <functional>
+#include <future>
 #include <linux/joystick.h>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/ioctl.h>
@@ -17,7 +19,10 @@
 #include <vector>
 
 #include "chassis/remote_kinematics.hpp"
+#include "chassis/can3_joystick.hpp"
 #include "geometry_msgs/msg/twist.hpp"
+#include "rcl_interfaces/srv/get_parameters.hpp"
+#include "rcl_interfaces/srv/set_parameters_atomically.hpp"
 #include "rclcpp/rclcpp.hpp"
 
 class RemoteCtrl : public rclcpp::Node
@@ -34,6 +39,15 @@ public:
     axis_angular_ = declare_parameter<int>("axis_angular", 6);
     axis_linear_ = declare_parameter<int>("axis_linear", 3);
     axis_lateral_ = declare_parameter<int>("axis_lateral", 0);
+    if (axis_linear_ < 0 || axis_lateral_ < 0 || axis_angular_ < -1 ||
+      axis_linear_ == 7 || axis_lateral_ == 7 || axis_angular_ == 7)
+    {
+      throw std::invalid_argument("axis7 is reserved for CAN3; axis_angular=-1 disables yaw");
+    }
+    invert_can3_direction_ = declare_parameter<bool>("invert_can3_direction", false);
+    const auto can3_node = declare_parameter<std::string>("can3_node", "/chassis");
+    can3_get_client_ = create_client<GetParameters>(can3_node + "/get_parameters");
+    can3_set_client_ = create_client<SetParameters>(can3_node + "/set_parameters_atomically");
 
     remote_config_.scale_linear_m_s = declare_parameter<double>("scale_linear", 0.6);
     remote_config_.scale_lateral_m_s = declare_parameter<double>("scale_lateral", 0.6);
@@ -49,6 +63,11 @@ public:
     enable_button_ = declare_parameter<int>("enable_button", -1);
     stop_button_ = declare_parameter<int>("stop_button", 0);
     emergency_stop_button_ = declare_parameter<int>("emergency_stop_button", 11);
+    for (const int button : {enable_button_, stop_button_, emergency_stop_button_}) {
+      if (button == 1 || button == 3) {
+        throw std::invalid_argument("buttons 3/1 are reserved for CAN3 motor selection");
+      }
+    }
 
     max_accel_ = declare_parameter<double>("max_accel", 0.6);
     max_decel_ = declare_parameter<double>("max_decel", 1.2);
@@ -93,6 +112,12 @@ public:
       get_logger(), "  buttons: stop=%d emergency-stop=%d",
       stop_button_, emergency_stop_button_);
     RCLCPP_INFO(get_logger(), "Waiting for active motion axes to report neutral");
+    RCLCPP_INFO(
+      get_logger(), "CAN3 remote: button3 selects previous motor, button1 selects next motor; "
+      "axis7 negative=+1 degree, positive=-1 degree; return to center before next step");
+    RCLCPP_INFO(
+      get_logger(), "CAN3 selected motor=1; direction inverted=%s; target node=%s",
+      invert_can3_direction_ ? "true" : "false", can3_node.c_str());
     if (timeout_sec_ > 0.0) {
       RCLCPP_INFO(get_logger(), "  event timeout: %.2fs", timeout_sec_);
     } else {
@@ -108,6 +133,106 @@ public:
   }
 
 private:
+  using GetParameters = rcl_interfaces::srv::GetParameters;
+  using SetParameters = rcl_interfaces::srv::SetParametersAtomically;
+
+  bool can3_busy() const {return can3_get_request_ || can3_set_request_;}
+
+  void handle_can3_action(const chassis::Can3JoystickAction & action)
+  {
+    if (action.selection_changed) {
+      can3_action_.reset();
+      // 未提交的调角取消；已提交的请求继续等待结果，不向新电机重放。
+      if (can3_get_request_) {cancel_can3_adjustment("motor selection changed");}
+      RCLCPP_INFO(get_logger(), "CAN3_SELECTED motor_id=%u", action.motor_id);
+    }
+    if (joystick_armed_ && action.delta_degrees != 0 && !can3_busy() && !can3_action_) {
+      can3_action_ = action;
+    }
+  }
+
+  void cancel_can3_adjustment(const char * reason)
+  {
+    if (can3_get_request_) {
+      can3_get_client_->remove_pending_request(can3_get_request_->request_id);
+      can3_get_request_.reset();
+    }
+    if (can3_set_request_) {
+      RCLCPP_WARN(
+        get_logger(), "CAN3 motor=%u: %s; submitted step may have taken effect",
+        can3_requested_motor_, reason);
+      can3_set_client_->remove_pending_request(can3_set_request_->request_id);
+      can3_set_request_.reset();
+    }
+    can3_action_.reset();
+  }
+
+  void update_can3_adjustment()
+  {
+    const auto time = std::chrono::steady_clock::now();
+    if (can3_busy() && time >= can3_deadline_) {
+      RCLCPP_WARN(get_logger(), "CAN3 parameter service timeout; step discarded, no retry");
+      cancel_can3_adjustment("timeout");
+      return;
+    }
+    try {
+      if (can3_set_request_) {
+        if (can3_set_request_->wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+          return;
+        }
+        const auto response = can3_set_request_->get();
+        can3_set_request_.reset();
+        if (response->result.successful) {
+          RCLCPP_INFO(
+            get_logger(), "CAN3_REMOTE motor_id=%u target_deg=%.3f accepted",
+            can3_requested_motor_, can3_requested_angle_);
+        } else {
+          RCLCPP_WARN(
+            get_logger(), "CAN3_REMOTE motor_id=%u rejected: %s",
+            can3_requested_motor_, response->result.reason.c_str());
+        }
+        return;
+      }
+      if (can3_get_request_) {
+        if (can3_get_request_->wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+          return;
+        }
+        const auto response = can3_get_request_->get();
+        can3_get_request_.reset();
+        if (response->values.size() != 1 ||
+          response->values[0].type != rcl_interfaces::msg::ParameterType::PARAMETER_DOUBLE ||
+          !std::isfinite(response->values[0].double_value))
+        {
+          throw std::runtime_error("CAN3 target parameter is missing or invalid");
+        }
+        can3_requested_angle_ = response->values[0].double_value + can3_requested_delta_;
+        auto request = std::make_shared<SetParameters::Request>();
+        request->parameters.push_back(
+          rclcpp::Parameter(
+            can3_parameter_name_, can3_requested_angle_).to_parameter_msg());
+        can3_set_request_.emplace(can3_set_client_->async_send_request(request));
+        return;
+      }
+      if (!can3_action_) {return;}
+      const auto action = *can3_action_;
+      can3_action_.reset();
+      if (!can3_get_client_->service_is_ready() || !can3_set_client_->service_is_ready()) {
+        RCLCPP_WARN(get_logger(), "CAN3 parameter service unavailable; step discarded");
+        return;
+      }
+      can3_requested_motor_ = action.motor_id;
+      can3_requested_delta_ = action.delta_degrees * (invert_can3_direction_ ? -1 : 1);
+      can3_parameter_name_ = "can3_motor_" + std::to_string(action.motor_id) + "_angle_deg";
+      auto request = std::make_shared<GetParameters::Request>();
+      request->names = {can3_parameter_name_};
+      can3_deadline_ = time + std::chrono::seconds(2);
+      can3_get_request_.emplace(can3_get_client_->async_send_request(request));
+    } catch (const std::exception & error) {
+      RCLCPP_WARN(get_logger(), "CAN3 remote request failed: %s", error.what());
+      cancel_can3_adjustment("request failed");
+    }
+  }
+
   static double limit_rate(double current, double target, double max_accel, double max_decel)
   {
     double diff = target - current;
@@ -162,9 +287,12 @@ private:
     axes_.assign(axis_count, 0.0);
     axis_seen_.assign(axis_count, false);
     joystick_armed_ = false;
+    can3_joystick_.reset();
     buttons_.assign(button_count, 0);
     RCLCPP_INFO(
       get_logger(), "Opened joystick with %u axes and %u buttons", axis_count, button_count);
+    RCLCPP_INFO(
+      get_logger(), "CAN3_SELECTED motor_id=1; waiting for axis7 neutral and buttons 3/1 released");
   }
 
   void read_joystick_events()
@@ -199,6 +327,8 @@ private:
       joy_fd_ = -1;
       joy_seen_ = false;
       joystick_armed_ = false;
+      can3_joystick_.reset();
+      cancel_can3_adjustment("joystick disconnected");
       target_twist_ = geometry_msgs::msg::Twist();
       break;
     }
@@ -211,12 +341,30 @@ private:
     if (type == JS_EVENT_AXIS && event.number < axes_.size()) {
       axes_[event.number] = normalize_axis(event.value);
       axis_seen_[event.number] = true;
+      if (event.number == 7 && (event.type & JS_EVENT_INIT) != 0) {
+        cancel_can3_adjustment("joystick initialization");
+      }
+      handle_can3_action(
+        can3_joystick_.observe(
+          event.number, axes_[event.number], (event.type & JS_EVENT_INIT) != 0));
     } else if (type == JS_EVENT_BUTTON && event.number < buttons_.size()) {
       buttons_[event.number] = event.value;
+      if ((static_cast<int>(event.number) == stop_button_ && event.value != 0) ||
+        (static_cast<int>(event.number) == enable_button_ && event.value == 0))
+      {
+        can3_joystick_.disarm();
+        cancel_can3_adjustment("stop/enable button");
+      }
       if (static_cast<int>(event.number) == emergency_stop_button_ && event.value != 0) {
         emergency_stop();
         return;
       }
+      if ((event.number == 1 || event.number == 3) && (event.type & JS_EVENT_INIT) != 0) {
+        cancel_can3_adjustment("joystick initialization");
+      }
+      handle_can3_action(
+        can3_joystick_.observe_button(
+          event.number, event.value != 0, (event.type & JS_EVENT_INIT) != 0));
     }
 
   }
@@ -224,6 +372,8 @@ private:
   void emergency_stop()
   {
     emergency_stopped_ = true;
+    can3_joystick_.disarm();
+    cancel_can3_adjustment("emergency stop");
     filtered_axes_.fill(0.0);
     target_twist_ = geometry_msgs::msg::Twist();
     smooth_twist_ = geometry_msgs::msg::Twist();
@@ -274,6 +424,7 @@ private:
 
   void timer_callback()
   {
+    can3_action_.reset();
     read_joystick_events();
     if (emergency_stopped_) {return;}
 
@@ -285,25 +436,41 @@ private:
     // A held stick or an accidentally selected trigger must not arm at startup.
     if (!joystick_armed_ && joy_fd_ >= 0) {
       const auto centered = [this](int index) {
-          return index >= 0 && static_cast<size_t>(index) < axes_.size() &&
+          return index == -1 || (index >= 0 && static_cast<size_t>(index) < axes_.size() &&
                  axis_seen_[index] &&
-                 chassis::remote_apply_deadzone(axes_[index], deadzone_) == 0.0;
+                 chassis::remote_apply_deadzone(axes_[index], deadzone_) == 0.0);
         };
-      if (centered(axis_linear_) && centered(axis_lateral_) && centered(axis_angular_)) {
+      if (centered(axis_linear_) && centered(axis_lateral_) && centered(axis_angular_) &&
+        can3_joystick_.neutral_ready())
+      {
         joystick_armed_ = true;
         RCLCPP_INFO(get_logger(), "Joystick centered: motion input enabled");
       }
     }
     if (!joystick_armed_) {
+      can3_joystick_.disarm();
+      cancel_can3_adjustment("joystick not centered");
       filtered_axes_.fill(0.0);
       target_twist_ = geometry_msgs::msg::Twist();
       smooth_twist_ = geometry_msgs::msg::Twist();
       publisher_->publish(smooth_twist_);
       return;
     }
-    if (!joy_seen_ ||
-      (timeout_sec_ > 0.0 && (now() - last_joy_time_).seconds() > timeout_sec_))
+    const bool stale = !joy_seen_ ||
+      (timeout_sec_ > 0.0 && (now() - last_joy_time_).seconds() > timeout_sec_);
+    if (stale || button_pressed(stop_button_) ||
+      (enable_button_ >= 0 && !button_pressed(enable_button_)))
     {
+      can3_joystick_.disarm();
+      cancel_can3_adjustment("joystick inactive");
+    } else {
+      if (!can3_joystick_.armed() && !can3_joystick_.arm()) {
+        cancel_can3_adjustment("CAN3 controls not neutral");
+      } else {
+        update_can3_adjustment();
+      }
+    }
+    if (stale) {
       filtered_axes_.fill(0.0);
       target_twist_ = geometry_msgs::msg::Twist();
     } else {
@@ -364,12 +531,30 @@ private:
   double joystick_low_pass_time_constant_s_{0.1};
   double deadzone_{0.05};
   double timeout_sec_{0.5};
+  chassis::Can3Joystick can3_joystick_;
+  std::optional<chassis::Can3JoystickAction> can3_action_;
+  rclcpp::Client<GetParameters>::SharedPtr can3_get_client_;
+  rclcpp::Client<SetParameters>::SharedPtr can3_set_client_;
+  std::optional<rclcpp::Client<GetParameters>::FutureAndRequestId> can3_get_request_;
+  std::optional<rclcpp::Client<SetParameters>::FutureAndRequestId> can3_set_request_;
+  std::chrono::steady_clock::time_point can3_deadline_{};
+  unsigned can3_requested_motor_{1};
+  int can3_requested_delta_{0};
+  double can3_requested_angle_{0};
+  std::string can3_parameter_name_;
+  bool invert_can3_direction_{false};
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<RemoteCtrl>());
+  int result = 0;
+  try {
+    rclcpp::spin(std::make_shared<RemoteCtrl>());
+  } catch (const std::exception & error) {
+    RCLCPP_FATAL(rclcpp::get_logger("remote_ctrl"), "%s", error.what());
+    result = 1;
+  }
   rclcpp::shutdown();
-  return 0;
+  return result;
 }

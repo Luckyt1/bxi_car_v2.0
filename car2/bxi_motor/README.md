@@ -16,6 +16,29 @@
 
 共享电机供电、PCI 初始化和风扇控制见 [bxi_hardware](../bxi_hardware/README.md)。本模块构造和析构都不发送电机指令，应用负责显式退出电机模式，再关闭共享电源。
 
+## 四种型号的默认配置
+
+按 [官网 CANFD/MIT 协议](https://wiki.bxirobotics.cn/actuators/can_communication/)（核对日期 2026-09-15），使用 `encoding_ranges(Model)` 选择量化范围：
+
+| Model 枚举 | 产品型号 | 力矩范围（Nm） | Kd 范围 |
+| --- | --- | --- | --- |
+| `Model::BXI5014_19` | BXI5014-19 / MOTOR_50 | -40～40 | 0～5 |
+| `Model::BXI5018_19` | BXI5018-19 / MOTOR_50_L | -40～40 | 0～5 |
+| `Model::BXI7010_19` | BXI7010-19 / MOTOR_70 | -80～80 | 0～5 |
+| `Model::BXI8515_19` | BXI8515-19 / MOTOR_85 | -160～160 | 0～20 |
+
+位置均为 ±12.5 rad，速度均为 ±45 rad/s，Kp 均为 0～500。型号配置只提供协议量化范围，不启动电机或修改设备寄存器，也不是额定/峰值工作能力限制。
+
+```cpp
+bxi::Command command;
+command.ranges = bxi::encoding_ranges(bxi::Model::BXI8515_19);
+command.kd = 1.0F;
+auto sent = motor.command(command);
+auto feedback = bxi::decode_feedback(incoming, command.ranges);
+```
+
+参数被上位机修改后，应按实际 `max_pos/max_vel/max_tor/kp_max/kd_max` 覆盖 `command.ranges`。旧代码的 `EncodingRanges{}` 保持50系列默认值，未知型号枚举会抛出 `std::invalid_argument`。完整产品规格对照见 [car2 README](../readme.md#bxi-电机调用)。
+
 ## 编码范围和协议约定
 
 | `Command` 字段 | 默认编码范围 | 位宽 |
@@ -26,7 +49,7 @@
 | `kd` | 0 ～ 5 | 12 |
 | `torque` | -40 ～ 40 | 12 |
 
-这些是源码中的编码范围，并非所接电机的额定范围。上游源码没有明确注明各物理量单位，接入具体型号前需要核对；接口不会把底盘线速度换算成电机速度，也不把这些数值当作 ISWV/EYOU 的输出轴 RPM。
+上表是50系列的默认编码范围，并非所接电机的额定范围。[官网反馈协议](https://wiki.bxirobotics.cn/actuators/mit_polling_reply/) 明确位置、速度、力矩单位分别为 rad、rad/s、Nm；接口不会把底盘线速度换算成电机速度，也不把这些数值当作 ISWV/EYOU 的输出轴 RPM。
 
 不同型号可以通过 `Command::ranges` 分别设置五个参数的编码范围，每个范围包含 `min` 和 `max`。范围参与数值校验和字节编码，必须与设备协议一致，不是运行时运动限位。默认值保持上表范围，原有 `Command{position, velocity, kp, kd, torque}` 写法仍可使用。
 
@@ -46,13 +69,13 @@ auto feedback = bxi::decode_feedback(incoming, command.ranges);
 
 同型号命令可以复制同一份 `EncodingRanges`；不同型号各自持有配置，互不影响。反馈解码需要传入对应电机的范围，否则使用默认范围；目前只使用并校验位置和速度范围。
 
-合法值沿用上游的量化截断方式；范围端点必须有限且 `min < max`。无效范围、越界、NaN、Inf 返回 `invalid_argument`，不发送帧。普通参数编码结果若与已知进入/退出指令重合，也会被拒绝。上游示例曾传入 `kd=6`，在默认 `[0,5]` 范围下仍被拒绝；只有实际型号支持且配置了相应编码范围时才可使用。
+合法值沿用上游的量化截断方式；范围端点必须有限且 `min < max`。无效范围、越界、NaN、Inf 返回 `invalid_argument`，不发送帧。普通参数编码结果若与官网五种特殊控制指令（0xFA..0xFE）重合，也会被拒绝，包括保存零点指令。上游示例曾传入 `kd=6`，在默认 `[0,5]` 范围下仍被拒绝；只有实际型号支持且配置了相应编码范围时才可使用。
 
 默认帧为标准 CAN ID、8 字节 CAN FD+BRS，沿用原 `motor_test.c` 的明确设置；可用 `FrameOptions{false, false}` 选择经典 CAN。上游 `chassis.cpp` 没有初始化帧 flags，不能据此判断真实线上的帧类型。本封装明确初始化全部帧字段，不自动修改板卡波特率。
 
-反馈至少需要 5 字节：位置取 `data[1]`、`data[2]`，速度取 `data[3]` 和 `data[4]` 高半字节。`prefix` 原样保留 `data[0]`，不推定其含义。源代码没有解析力矩、电流和温度反馈，因此接口不虚构这些字段。无效帧、短帧及非标准数据帧返回 `protocol_error`。
+反馈至少需要 5 字节：位置取 `data[1]`、`data[2]`，速度取 `data[3]` 和 `data[4]` 高半字节。`prefix` 原样保留 `data[0]`，官网将其定义为电机 `can_id`。此基础接口保留位置/速度解析，不新增力矩、温度或 AUX 字段解析。无效帧、短帧及非标准数据帧返回 `protocol_error`。
 
-上游底盘使用 CAN bus 2、指令/反馈 ID 1 和 2；早期延迟样例使用 CAN0、指令 ID 1、监听 ID 0x11。调用方应按实际接线及电机协议路由反馈，不套用未经确认的 ID 偏移公式。`decode_feedback()` 不安装或覆盖接收回调。
+上游底盘使用 CAN bus 2、指令/反馈 ID 1 和 2；早期延迟样例使用 CAN0、指令 ID 1、监听 ID 0x11。官网规定默认 `master_id = can_id | 0x010`，也允许单独修改；调用方应按实际 `master_id` 路由，不能把默认公式当作固定约束。`decode_feedback()` 不安装或覆盖接收回调。
 
 ## 离线示例
 
@@ -65,7 +88,9 @@ int main()
   iswv::FakeTransport transport;
   bxi::Motor motor(transport, 1);
   if (!motor.enter_motor_mode()) { return 1; }
-  const auto command = motor.command({0.0F, 0.0F, 0.0F, 1.0F, 0.0F});
+  bxi::Command target{0.0F, 0.0F, 0.0F, 1.0F, 0.0F};
+  target.ranges = bxi::encoding_ranges(bxi::Model::BXI5014_19);
+  const auto command = motor.command(target);
   const auto exit = motor.exit_motor_mode();
   return command && exit ? 0 : 1;
 }
@@ -105,4 +130,4 @@ target_link_libraries(my_app PRIVATE bxi::motor)
 
 适配保留合法参数的字节编码，增加输入和反馈长度检查，修复未初始化 CAN 帧，并避免原退出路径“仅初始化一个元素却发送两个元素”的问题。原有 [reference/motor_test.c](reference/motor_test.c) 保留为初次收录依据。
 
-测试包含上游编码对照、边界与随机合法值、越界/非有限值拒绝、模式指令、反馈解码及传输失败传播。当前验证为离线协议和构建测试；具体型号单位、机械参数、反馈完整字段及实机运行仍需按设备补充。
+测试包含上游编码对照、边界与随机合法值、越界/非有限值拒绝、模式指令、反馈解码及传输失败传播。当前验证为离线协议和构建测试；四种型号默认映射已经按官网配置；实际设备寄存器值、运行限位及实机表现仍须与使用的设备匹配。
