@@ -74,6 +74,7 @@ stdbuf -oL -eL "$chassis_bin" --ros-args \
 chassis_pid=$!
 
 stdbuf -oL -eL "$remote_bin" --ros-args \
+  -p start_chassis:=false \
   -p "device_path:=${JOYSTICK_DEVICE:-/dev/input/js0}" \
   -p "axis_linear:=${JOYSTICK_LINEAR_AXIS:-3}" \
   -p "axis_lateral:=${JOYSTICK_LATERAL_AXIS:-0}" \

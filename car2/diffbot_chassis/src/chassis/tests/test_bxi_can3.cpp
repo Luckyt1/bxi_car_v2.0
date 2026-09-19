@@ -2,7 +2,7 @@
 #undef NDEBUG
 #endif
 
-#include "chassis/motor/bxi_can3.hpp"
+#include "chassis/control/arm_control.h"
 
 #include <array>
 #include <atomic>
@@ -237,14 +237,14 @@ iswv::CanFrame feedback_frame(
 void zero_hold_requires_saved_positions_then_refreshes_the_same_target()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
-  expect_throw<std::logic_error>([&] {motors.hold_zero();});
+  chassis::ArmController motors(transport);
+  expect_throw<std::logic_error>([&] {motors.update();});
   assert(transport->attempts.empty());
   motors.initialize();
-  expect_throw<std::logic_error>([&] {motors.hold_zero();});
+  expect_throw<std::logic_error>([&] {motors.update();});
   assert_all_stopped(*transport, 0);
   motors.save_zero_positions();
-  motors.hold_zero();
+  motors.update();
   assert(transport->attempts.size() == 12);
   for (std::uint32_t id = 1; id <= 3; ++id) {
     assert_mode(transport->attempts[id - 1], id, 0xfd);
@@ -256,7 +256,7 @@ void zero_hold_requires_saved_positions_then_refreshes_the_same_target()
   for (int refresh = 0; refresh < 2; ++refresh) {
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     const auto before = transport->attempts.size();
-    motors.hold_zero();
+    motors.update();
     assert(transport->attempts.size() == before + 3);
     for (std::uint32_t id = 1; id <= 3; ++id) {
       assert_zero_hold(transport->attempts[before + id - 1], id);
@@ -269,12 +269,12 @@ void failed_zero_hold_start_stops_the_group_and_cannot_resume()
   for (std::uint32_t failed_id = 1; failed_id <= 3; ++failed_id) {
     for (const bool fail_command : {false, true}) {
       auto transport = std::make_shared<RecordingTransport>();
-      chassis::BxiCan3 motors(transport);
+      chassis::ArmController motors(transport);
       motors.initialize();
       motors.save_zero_positions();
       const auto before = transport->attempts.size();
       transport->fail_at = before + 2 * (failed_id - 1) + (fail_command ? 1 : 0);
-      expect_throw<std::runtime_error>([&] {motors.hold_zero();});
+      expect_throw<std::runtime_error>([&] {motors.update();});
       for (std::uint32_t id = 1; id <= failed_id; ++id) {
         assert_mode(transport->attempts[before + 2 * (id - 1)], id, 0xfc);
         if (id < failed_id || fail_command) {
@@ -282,11 +282,11 @@ void failed_zero_hold_start_stops_the_group_and_cannot_resume()
         }
       }
       assert_all_stopped(*transport, transport->fail_at + 1);
-      expect_throw<std::logic_error>([&] {motors.hold_zero();});
+      expect_throw<std::logic_error>([&] {motors.update();});
       assert_all_stopped(*transport, transport->fail_at + 1);
       motors.initialize();
       const auto after_reinitialize = transport->attempts.size();
-      expect_throw<std::logic_error>([&] {motors.hold_zero();});
+      expect_throw<std::logic_error>([&] {motors.update();});
       assert(transport->attempts.size() == after_reinitialize);
     }
   }
@@ -296,20 +296,20 @@ void failed_zero_hold_refresh_stops_the_group_and_cannot_resume()
 {
   for (std::uint32_t failed_id = 1; failed_id <= 3; ++failed_id) {
     auto transport = std::make_shared<RecordingTransport>();
-    chassis::BxiCan3 motors(transport);
+    chassis::ArmController motors(transport);
     motors.initialize();
     motors.save_zero_positions();
-    motors.hold_zero();
+    motors.update();
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     const auto before = transport->attempts.size();
     transport->fail_at = before + failed_id - 1;
-    expect_throw<std::runtime_error>([&] {motors.hold_zero();});
+    expect_throw<std::runtime_error>([&] {motors.update();});
     for (std::uint32_t id = 1; id <= failed_id; ++id) {
       assert_zero_hold(transport->attempts[before + id - 1], id);
     }
     assert_all_stopped(*transport, before + failed_id);
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    expect_throw<std::logic_error>([&] {motors.hold_zero();});
+    expect_throw<std::logic_error>([&] {motors.update();});
     assert_all_stopped(*transport, before + failed_id);
   }
 }
@@ -318,10 +318,10 @@ void stopping_or_reinitializing_requires_an_explicit_new_zero_save()
 {
   for (const bool reinitialize : {false, true}) {
     auto transport = std::make_shared<RecordingTransport>();
-    chassis::BxiCan3 motors(transport);
+    chassis::ArmController motors(transport);
     motors.initialize();
     motors.save_zero_positions();
-    motors.hold_zero();
+    motors.update();
     const auto before = transport->attempts.size();
     if (reinitialize) {
       motors.initialize();
@@ -330,10 +330,10 @@ void stopping_or_reinitializing_requires_an_explicit_new_zero_save()
     }
     assert_all_stopped(*transport, before);
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    expect_throw<std::logic_error>([&] {motors.hold_zero();});
+    expect_throw<std::logic_error>([&] {motors.update();});
     assert_all_stopped(*transport, before);
     motors.save_zero_positions();
-    motors.hold_zero();
+    motors.update();
     assert(transport->attempts.size() == before + 12);
     for (std::uint32_t id = 1; id <= 3; ++id) {
       assert_mode(transport->attempts[before + 3 + id - 1], id, 0xfe);
@@ -346,7 +346,7 @@ void stopping_or_reinitializing_requires_an_explicit_new_zero_save()
 void initialization_and_commands_require_explicit_enable()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   assert(transport->attempts.empty());
   expect_throw<std::logic_error>([&] {motors.enable(1);});
   assert(transport->attempts.empty());
@@ -381,7 +381,7 @@ void initialization_and_commands_require_explicit_enable()
 void zero_positions_are_saved_once_per_explicit_startup_call()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   expect_throw<std::logic_error>([&] {motors.save_zero_positions();});
   assert(transport->attempts.empty());
   motors.initialize();
@@ -413,7 +413,7 @@ void zero_save_failure_stops_every_motor_without_saving_remaining_ids()
 {
   for (std::uint32_t failed_id = 1; failed_id <= 3; ++failed_id) {
     auto transport = std::make_shared<RecordingTransport>();
-    chassis::BxiCan3 motors(transport);
+    chassis::ArmController motors(transport);
     motors.initialize();
     const auto before = transport->attempts.size();
     transport->fail_at = before + failed_id - 1;
@@ -422,7 +422,7 @@ void zero_save_failure_stops_every_motor_without_saving_remaining_ids()
       assert_mode(transport->attempts[before + id - 1], id, 0xfe);
     }
     assert_all_stopped(*transport, before + failed_id);
-    expect_throw<std::logic_error>([&] {motors.hold_zero();});
+    expect_throw<std::logic_error>([&] {motors.update();});
     expect_throw<std::logic_error>([&] {motors.save_zero_positions();});
     for (std::uint32_t id = 1; id <= 3; ++id) {
       expect_throw<std::logic_error>([&] {motors.enable(id);});
@@ -431,7 +431,7 @@ void zero_save_failure_stops_every_motor_without_saving_remaining_ids()
     assert_all_stopped(*transport, before + failed_id);
     motors.initialize();
     const auto after_reinitialize = transport->attempts.size();
-    expect_throw<std::logic_error>([&] {motors.hold_zero();});
+    expect_throw<std::logic_error>([&] {motors.update();});
     assert(transport->attempts.size() == after_reinitialize);
   }
 }
@@ -439,7 +439,7 @@ void zero_save_failure_stops_every_motor_without_saving_remaining_ids()
 void all_three_motors_use_85_series_encoding()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   // Intentionally retain Command's 50-series defaults; CAN3 owns the model selection.
   const bxi::Command target{0.0F, 0.0F, 0.0F, 10.0F, 80.0F};
@@ -471,12 +471,12 @@ void all_three_motors_use_85_series_encoding()
 
 void invalid_inputs_never_send_a_motion_command()
 {
-  expect_throw<std::invalid_argument>([] {chassis::BxiCan3 motors(nullptr);});
+  expect_throw<std::invalid_argument>([] {chassis::ArmController motors(nullptr);});
   auto transport = std::make_shared<RecordingTransport>();
   transport->open = false;
-  expect_throw<std::invalid_argument>([&] {chassis::BxiCan3 motors(transport);});
+  expect_throw<std::invalid_argument>([&] {chassis::ArmController motors(transport);});
   transport->open = true;
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   for (const auto id : {0U, 4U, std::numeric_limits<std::uint32_t>::max()}) {
     expect_throw<std::invalid_argument>([&] {motors.enable(id);});
@@ -496,7 +496,7 @@ void send_failure_disables_every_motor_and_requires_reinitialization()
 {
   for (const bool fail_enable : {false, true}) {
     auto transport = std::make_shared<RecordingTransport>();
-    chassis::BxiCan3 motors(transport);
+    chassis::ArmController motors(transport);
     motors.initialize();
     motors.enable(1);
     motors.enable(3);
@@ -531,7 +531,7 @@ void failed_stop_or_initialization_still_attempts_every_id()
 {
   for (const bool fail_initialization : {false, true}) {
     auto transport = std::make_shared<RecordingTransport>();
-    chassis::BxiCan3 motors(transport);
+    chassis::ArmController motors(transport);
     if (!fail_initialization) {
       motors.initialize();
       for (std::uint32_t id = 1; id <= 3; ++id) {
@@ -554,7 +554,7 @@ void failed_stop_or_initialization_still_attempts_every_id()
       expect_throw<std::logic_error>([&] {motors.command(id, {});});
     }
     expect_throw<std::logic_error>([&] {motors.save_zero_positions();});
-    expect_throw<std::logic_error>([&] {motors.hold_zero();});
+    expect_throw<std::logic_error>([&] {motors.update();});
     assert_all_stopped(*transport, before);
   }
 }
@@ -564,7 +564,7 @@ void destructor_attempts_every_stop_even_after_a_send_failure()
   auto transport = std::make_shared<RecordingTransport>();
   std::size_t before = 0;
   {
-    chassis::BxiCan3 motors(transport);
+    chassis::ArmController motors(transport);
     motors.initialize();
     for (std::uint32_t id = 1; id <= 3; ++id) {
       motors.enable(id);
@@ -578,7 +578,7 @@ void destructor_attempts_every_stop_even_after_a_send_failure()
 void diagnostic_reports_waiting_then_no_reply_when_no_feedback_arrives()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   const auto first = motors.take_feedback_diagnostic(base);
@@ -600,7 +600,7 @@ void diagnostic_reports_waiting_then_no_reply_when_no_feedback_arrives()
 void diagnostic_reports_all_three_matching_replies()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   const auto motor1 = feedback_frame(1, 0x8000, 0x800, base);
@@ -624,7 +624,7 @@ void diagnostic_reports_all_three_matching_replies()
 void diagnostic_reports_partial_replies_without_promoting_waiting_axes()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   transport->inject(feedback_frame(2, 0x8000, 0x800, base));
@@ -639,7 +639,7 @@ void diagnostic_reports_partial_replies_without_promoting_waiting_axes()
 void diagnostic_marks_replied_feedback_stale_then_replied_after_recovery()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   transport->inject(feedback_frame(1, 0x8000, 0x800, base));
@@ -664,7 +664,7 @@ void diagnostic_marks_replied_feedback_stale_then_replied_after_recovery()
 void diagnostic_recovers_from_stale_reply_without_reinitializing()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   transport->inject(feedback_frame(1, 0x8000, 0x800, base));
@@ -685,7 +685,7 @@ void diagnostic_recovers_from_stale_reply_without_reinitializing()
 void first_reply_is_reported_immediately_but_continuous_feedback_is_throttled()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto before = transport->attempts.size();
   assert_motor_state(motors.take_feedback_diagnostic(), 1, "WAITING", 0);
@@ -704,7 +704,7 @@ void first_reply_is_reported_immediately_but_continuous_feedback_is_throttled()
 void diagnostic_rejects_short_prefix_mismatch_and_command_echo_frames()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   auto short_frame = feedback_frame(1, 0x8000, 0x800, base);
@@ -736,7 +736,7 @@ void diagnostic_rejects_short_prefix_mismatch_and_command_echo_frames()
 void diagnostic_rejects_extended_remote_error_and_transport_error_as_replies()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   auto extended = feedback_frame(1, 0x8000, 0x800, base);
@@ -761,7 +761,7 @@ void diagnostic_rejects_extended_remote_error_and_transport_error_as_replies()
 void diagnostic_preserves_recent_unmatched_frame_summary()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   iswv::CanFrame unmatched{};
@@ -780,7 +780,7 @@ void diagnostic_preserves_recent_unmatched_frame_summary()
 void diagnostic_initialize_resets_receive_counts_and_feedback_state()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   transport->inject(feedback_frame(3, 0x8000, 0x800, base));
@@ -807,7 +807,7 @@ void diagnostic_unregisters_handlers_on_destruction_and_copied_callback_is_safe(
   iswv::TransportErrorHandler copied_error;
   const auto base = std::chrono::steady_clock::now();
   {
-    chassis::BxiCan3 motors(transport);
+    chassis::ArmController motors(transport);
     motors.initialize();
     copied_receive = transport->receive_handler_copy();
     copied_error = transport->error_handler_copy();
@@ -819,7 +819,7 @@ void diagnostic_unregisters_handlers_on_destruction_and_copied_callback_is_safe(
   copied_receive(feedback_frame(1, 0x8000, 0x800, base));
   copied_error(iswv::make_error(iswv::ErrorCode::transport_error, "late copied callback"));
 
-  chassis::BxiCan3 next(transport);
+  chassis::ArmController next(transport);
   next.initialize();
   const auto report = next.take_feedback_diagnostic(base + std::chrono::milliseconds(100));
   assert_contains(report, "state=WAITING");
@@ -830,7 +830,7 @@ void diagnostic_unregisters_handlers_on_destruction_and_copied_callback_is_safe(
 void diagnostic_callback_and_report_are_safe_to_call_concurrently()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport);
+  chassis::ArmController motors(transport);
   motors.initialize();
   const auto base = std::chrono::steady_clock::now();
   std::atomic<bool> keep_running{true};
@@ -870,7 +870,7 @@ void overspeed_feedback_latches_fault_and_requests_power_off()
   for (const auto velocity_raw : {0x91eU, 0x6e1U}) {
     auto transport = std::make_shared<RecordingTransport>();
     int power_off_count = 0;
-    chassis::BxiCan3 motors(transport, [&] {++power_off_count;});
+    chassis::ArmController motors(transport, [&] {++power_off_count;});
     motors.initialize();
     const auto before = transport->attempts.size();
     transport->inject(feedback_frame(1, 0x8000, static_cast<std::uint16_t>(velocity_raw)));
@@ -892,7 +892,7 @@ void speed_limit_uses_sixty_rpm_boundary_for_each_axis()
   for (std::uint32_t id = 1; id <= 3; ++id) {
     auto transport = std::make_shared<RecordingTransport>();
     int power_off_count = 0;
-    chassis::BxiCan3 motors(transport, [&] {++power_off_count;});
+    chassis::ArmController motors(transport, [&] {++power_off_count;});
     motors.initialize();
 
     transport->inject(feedback_frame(id, 0x8000, 0x91d));
@@ -908,7 +908,7 @@ void invalid_feedback_never_triggers_speed_cutoff()
 {
   auto transport = std::make_shared<RecordingTransport>();
   int power_off_count = 0;
-  chassis::BxiCan3 motors(transport, [&] {++power_off_count;});
+  chassis::ArmController motors(transport, [&] {++power_off_count;});
   motors.initialize();
 
   auto short_expected = feedback_frame(1, 0x8000, 0x91e);
@@ -929,13 +929,13 @@ void lost_feedback_after_first_hold_latches_fault()
 {
   auto transport = std::make_shared<RecordingTransport>();
   int power_off_count = 0;
-  chassis::BxiCan3 motors(transport, [&] {++power_off_count;});
+  chassis::ArmController motors(transport, [&] {++power_off_count;});
   motors.initialize();
   motors.save_zero_positions();
   const auto base = std::chrono::steady_clock::now();
-  motors.hold_zero(base);
+  motors.update(base);
 
-  expect_throw<std::logic_error>([&] {motors.hold_zero(base + std::chrono::milliseconds(1001));});
+  expect_throw<std::logic_error>([&] {motors.update(base + std::chrono::milliseconds(1001));});
   assert(power_off_count == 1);
   assert_contains(motors.fault_reason(), "feedback missing for more than 1s");
   expect_throw<std::logic_error>([&] {motors.initialize();});
@@ -944,11 +944,11 @@ void lost_feedback_after_first_hold_latches_fault()
 void target_angle_requires_recent_feedback_and_waits_until_next_hold()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport, [] {});
+  chassis::ArmController motors(transport, [] {});
   motors.initialize();
   motors.save_zero_positions();
   const auto base = std::chrono::steady_clock::now();
-  motors.hold_zero(base);
+  motors.update(base);
 
   expect_throw<std::logic_error>([&] {motors.set_target_degrees(2, 1.0);});
   transport->inject(feedback_frame(2, 0x8000, 0x800));
@@ -957,7 +957,7 @@ void target_angle_requires_recent_feedback_and_waits_until_next_hold()
   assert(motors.target_degrees(2) == 1.0);
   assert(transport->attempts.size() == before);
 
-  motors.hold_zero(base + std::chrono::milliseconds(25));
+  motors.update(base + std::chrono::milliseconds(25));
   assert(transport->attempts.size() == before + 3);
   assert_hold_target(transport->attempts[before], 1, 0.0);
   assert_hold_target(transport->attempts[before + 1], 2, 1.0);
@@ -967,11 +967,11 @@ void target_angle_requires_recent_feedback_and_waits_until_next_hold()
 void target_angle_rejects_bad_or_stale_requests()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(transport, [] {});
+  chassis::ArmController motors(transport, [] {});
   motors.initialize();
   motors.save_zero_positions();
   const auto base = std::chrono::steady_clock::now();
-  motors.hold_zero(base);
+  motors.update(base);
   transport->inject(feedback_frame(1, 0x8000, 0x800));
 
   expect_throw<std::invalid_argument>(
@@ -984,7 +984,7 @@ void target_angle_rejects_bad_or_stale_requests()
 void power_off_failure_is_recorded_with_the_latched_fault()
 {
   auto transport = std::make_shared<RecordingTransport>();
-  chassis::BxiCan3 motors(
+  chassis::ArmController motors(
     transport, [] {throw std::runtime_error("cutoff relay command failed");});
   motors.initialize();
   transport->inject(feedback_frame(3, 0x8000, 0x91e));
@@ -1001,7 +1001,7 @@ void empty_send_errors_and_exceptions_still_disable_the_group()
   for (bool throw_error : {false, true}) {
     for (bool fail_command : {false, true}) {
       auto transport = std::make_shared<RecordingTransport>();
-      chassis::BxiCan3 motors(transport);
+      chassis::ArmController motors(transport);
       motors.initialize();
       motors.enable(2);
       transport->failure_message.clear();
@@ -1022,16 +1022,16 @@ void overspeed_during_hold_blocks_all_motion_and_cannot_be_reset()
 {
   auto transport = std::make_shared<RecordingTransport>();
   int cutoffs = 0;
-  chassis::BxiCan3 motors(transport, [&] {++cutoffs;});
+  chassis::ArmController motors(transport, [&] {++cutoffs;});
   motors.initialize();
   motors.save_zero_positions();
-  motors.hold_zero();
+  motors.update();
   transport->inject(feedback_frame(2, 0x8000, 0x91e));
   transport->inject(feedback_frame(2, 0x8000, 0x800));
   const auto before = transport->attempts.size();
   expect_throw<std::logic_error>([&] {motors.initialize();});
   expect_throw<std::logic_error>([&] {motors.save_zero_positions();});
-  expect_throw<std::logic_error>([&] {motors.hold_zero();});
+  expect_throw<std::logic_error>([&] {motors.update();});
   for (unsigned id = 1; id <= 3; ++id) {
     expect_throw<std::logic_error>([&] {motors.enable(id);});
     expect_throw<std::logic_error>([&] {motors.command(id, {});});
@@ -1048,16 +1048,16 @@ void missing_one_axis_cuts_power_even_when_the_other_two_reply()
   for (unsigned missing = 1; missing <= 3; ++missing) {
     auto transport = std::make_shared<RecordingTransport>();
     int cutoffs = 0;
-    chassis::BxiCan3 motors(transport, [&] {++cutoffs;});
+    chassis::ArmController motors(transport, [&] {++cutoffs;});
     motors.initialize();
     motors.save_zero_positions();
     const auto base = std::chrono::steady_clock::now() - std::chrono::milliseconds(900);
-    motors.hold_zero(base);
+    motors.update(base);
     for (unsigned id = 1; id <= 3; ++id) {
       if (id != missing) {transport->inject(feedback_frame(id, 0x8000, 0x800));}
     }
     const auto before = transport->attempts.size();
-    expect_throw<std::logic_error>([&] {motors.hold_zero(base + std::chrono::seconds(1));});
+    expect_throw<std::logic_error>([&] {motors.update(base + std::chrono::seconds(1));});
     assert(cutoffs == 1);
     assert(transport->attempts.size() == before);
     assert_contains(motors.fault_reason(), "CAN3 motor " + std::to_string(missing));
@@ -1070,7 +1070,7 @@ void copied_callback_after_destruction_cannot_cut_power()
   iswv::ReceiveHandler callback;
   int cutoffs = 0;
   {
-    chassis::BxiCan3 motors(transport, [&] {++cutoffs;});
+    chassis::ArmController motors(transport, [&] {++cutoffs;});
     callback = transport->receive_handler_copy();
   }
   callback(feedback_frame(1, 0x8000, 0x91e));

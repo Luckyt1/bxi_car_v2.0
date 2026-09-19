@@ -1,5 +1,5 @@
-#include "chassis/chassis_controller.hpp"
-#include "chassis/motor/bxi_can3.hpp"
+#include "chassis/control/chassis_control.h"
+#include "chassis/control/arm_control.h"
 
 #include <chrono>
 #include <cmath>
@@ -46,12 +46,12 @@ int main(int argc, char ** argv)
     auto keep_running = [] {return running != 0;};
     chassis.initialize(keep_running);
     // 声明在 chassis 后，退出时先停止 CAN3 电机，再由底盘断电。
-    chassis::BxiCan3 bxi_can3;
+    chassis::ArmController bxi_can3;
     bxi_can3.initialize();
     bxi_can3.save_zero_positions();  // ID 1/2/3 各保存一次当前位置为零点。
     const auto keep_running_with_hold = [&] {
         if (!running) {return false;}
-        bxi_can3.hold_zero();  // 校准期间也刷新 p/v/t=0、Kp=200、Kd=4。
+        bxi_can3.update();  // 校准期间也刷新 p/v/t=0、Kp=200、Kd=4。
         const auto report = bxi_can3.take_feedback_diagnostic();
         if (!report.empty()) {std::cout << report << std::endl;}
         return true;
@@ -61,7 +61,7 @@ int main(int argc, char ** argv)
     if (running && rpm > 0.0) {chassis.forward(rpm);}
     while (running) {
       // The application can call set_velocity(x, y, yaw) or stop() here for its next operation.
-      bxi_can3.hold_zero();
+      bxi_can3.update();
       chassis.update();
       const auto report = bxi_can3.take_feedback_diagnostic();
       if (!report.empty()) {std::cout << report << std::endl;}

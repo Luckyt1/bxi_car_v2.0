@@ -157,6 +157,8 @@ class KeyControlHarness:
                     self.binary,
                     "--ros-args",
                     "-p",
+                    "start_chassis:=false",
+                    "-p",
                     f"device_path:={self.fifo}",
                     "-p",
                     f"cmd_vel_topic:={self.cmd_topic}",
