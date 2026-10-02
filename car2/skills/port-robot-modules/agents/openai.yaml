@@ -1,0 +1,4 @@
+interface:
+  display_name: "机器人模块移植"
+  short_description: "参考示例项目移植板卡、电机、机械臂和底盘模块，接入构建并完成离线验证"
+  default_prompt: "使用 $port-robot-modules，参考这个示例项目，将所需机器人模块移植到目标项目，完成接口接入和离线验证。"

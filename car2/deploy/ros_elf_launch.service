@@ -1,0 +1,29 @@
+[Unit]
+Description=Chassis and EtherCAT arm joystick control (wait for start button)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/bxi/tang/car2
+Environment=ROS_DOMAIN_ID=89
+Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+Environment=ROS_LOCALHOST_ONLY=0
+Environment='CYCLONEDDS_URI=<CycloneDDS><Domain Id="any"><General><Interfaces><NetworkInterface name="lo" multicast="true"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
+Environment=JOYSTICK_DEVICE=/dev/input/jsBattleDragon
+Environment=CHASSIS_CONFIG=/home/bxi/tang/car2/src/config/steering.yaml
+Environment=YIYOU_CONFIG=/home/bxi/tang/car2/src/config/yiyou_ethercat.yaml
+ExecStartPre=/usr/bin/test -x /home/bxi/tang/car2/build/chassis/robot_control
+ExecStartPre=/usr/sbin/ip link set dev enp86s0 up
+ExecStart=/bin/bash /home/bxi/tang/car2/start_chassis_arm.sh --ros-args -p arm_speech_domain_id:=22
+Restart=always
+RestartSec=3
+KillMode=control-group
+KillSignal=SIGINT
+TimeoutStopSec=15s
+SendSIGKILL=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

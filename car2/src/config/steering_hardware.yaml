@@ -1,0 +1,62 @@
+# 硬件、驱动器和校准配置；日常速度请修改 steering.yaml。
+# 四轮顺序：FL 前左、RL 后左、RR 后右、FR 前右。
+# 驱动器参数为 null 时，启动读取后会回填本文件。
+chassis:
+  ros__parameters:
+    can_bus: 0
+    drive_can_buses: [1, 1, 2, 2]
+    node_ids: [1, 2, 3, 4]
+    drive_node_ids: [1, 2, 3, 4]
+    rpdo_transmission_type: 254
+    tpdo_transmission_type: 254
+    tpdo_inhibit_time: 0
+    tpdo_event_timer_ms: 10
+    wheel_base_m: 0.42
+    track_width_m: 0.36
+    wheel_diameter_m: 0.13
+    encoder_resolution: 65536
+    gear_ratio: 9.0252707581
+    drive_encoder_resolution: 65536
+    drive_gear_ratio: 10
+    max_steering_angle_rad: 3.141592653589793
+    steering_forward_offset_rad: 1.5707963267948966
+    inverted: [true, true, true, true]
+    drive_inverted: [false, false, true, true]
+    zero_offset_inc: [135251, 99572, -245279, -155865]
+    profile_velocity_rpm: 400
+    acceleration_rps2: 400
+    deceleration_rps2: 400
+    drive_steering_tolerance_rad: 0.1
+    steering_limit_margin_rad: 0.0872664626
+    steering_target_margin_rad: 0.05235987755982989
+    drive_alignment_stop_rad: 0.5
+    swerve_speed_epsilon_m_s: 0.0001
+    swerve_branch_hysteresis_rad: 0.0
+    drive_alignment_policy: none
+    drive_alignment_pause_rad: 0.35
+    steering_velocity_loop_kp: [4, 4, 4, 4]
+    steering_velocity_loop_ki: [0, 0, 0, 0]
+    steering_velocity_feedback_filter: [7, 7, 7, 7]
+    steering_position_loop_kp: [1000, 1000, 1000, 1000]
+    steering_position_smoothing_filter: [1, 1, 1, 1]
+    drive_velocity_loop_kp: [32, 32, 32, 32]
+    drive_velocity_loop_ki: [1, 1, 1, 1]
+    drive_velocity_feedback_filter: [7, 7, 7, 7]
+    drive_position_loop_kp: [500, 500, 500, 500]
+    drive_position_smoothing_filter: [1, 1, 1, 1]
+    steering_calibrated: true
+    calibration_speed_rpm: 500
+    calibration_search_speed_rpm: 8
+    calibration_torque_percent: 10
+    calibration_torque_limit_nm: 25
+    calibration_contact_torque_nm: 2
+    calibration_min_limit_separation_rad: 3.141592653589793
+    calibration_position_epsilon_inc: 64
+    calibration_stall_time_s: 0
+    calibration_current_threshold_a: 0.05
+    calibration_current_rise_a: 1.5
+    calibration_timeout_s: 230
+    calibration_node_id: 1
+    calibration_ignore_drive_fault: false
+    motor_peak_current_a: 14.3
+    motor_torque_constant_nm_per_a: 0.1153846154

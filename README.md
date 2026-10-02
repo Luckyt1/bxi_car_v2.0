@@ -35,18 +35,27 @@ colcon test-result --verbose
 
 ```text
 car2/diffbot_chassis/src/chassis/
-├── include/
-│   ├── chassis/motor/      # BXI、ISWV、意优和 BXI PCI transport 公开接口
-│   ├── chassis/control/    # 底盘、CAN3 机械臂、遥控器公开接口
-│   └── iswv/               # 原 ISWV CANopen 公共头
-├── src/
-│   ├── motor/              # 三类电机与 BXI PCI transport
-│   ├── motor/canopen/      # ISWV CANopen 核心实现
-│   └── control/            # chassis/arm/remote/main
+├── third_party/
+│   ├── motor/
+│   │   ├── README.md           # 模块文件用途
+│   │   ├── src/                # 三类电机与 BXI PCI transport
+│   │   │   └── canopen/        # ISWV CANopen 核心实现
+│   │   └── include/
+│   │       ├── chassis/motor/  # 电机与 transport 公开接口
+│   │       ├── chassis/        # steering_*.hpp 配置与调参接口
+│   │       └── iswv/           # ISWV CANopen 公共头
+│   └── control/
+│       ├── README.md           # 模块文件用途
+│       ├── src/                # chassis/arm/remote/main
+│       └── include/chassis/    # control/ 公开接口及控制辅助头文件
 ├── tests/                  # 离线回归测试
 ├── tests/canopen/          # 原 ISWV CANopen 测试
 ├── vendor/bxi_pci/         # 厂商头文件与静态库
 └── docs/                   # 依赖来源、协议手册与许可证说明
 ```
+
+各模块的 `.cpp` 集中在自己的 `src/`，公开头文件放在自己的 `include/`。其他模块通过原有的 `#include "chassis/motor/..."`、`#include "chassis/control/..."` 引用，并链接对应 CMake 目标；头文件搜索路径由目标自动传递，安装后的接口路径保持一致。
+
+被调用的模块集中放在 `third_party/`。各文件用途见 [motor/README.md](car2/diffbot_chassis/src/chassis/third_party/motor/README.md) 和 [control/README.md](car2/diffbot_chassis/src/chassis/third_party/control/README.md)。
 
 离线测试只能证明协议编码、控制状态机和模拟通信路径，不证明真实接线、机械限位、力矩参数、电源断开时延或急停功能有效。

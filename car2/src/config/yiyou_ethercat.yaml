@@ -1,0 +1,23 @@
+# 工控机上的意优 EtherCAT 专用实体网口；lo 不是实体网口。
+# 含机械臂的主程序默认加载本文件；--params-file 和 -p 可覆盖参数。
+chassis:
+  ros__parameters:
+    yiyou_ethercat_interface: "enp86s0"
+    # 前三轴 PP，第四轴 CST 电流控制；第四轴上电零电流，不回零。
+    yiyou_ethercat_slaves: [1, 2, 3, 4]
+    # 启动必须为 0；运行时为额定电流千分比 [-1000,1000]。
+    # 零电流不保持位置，也不提供重力支撑。
+    yiyou_motor_4_current_permille: 0
+    # 前三轴依次为肩、肘、腕；编码器 0 对应仿真 q=[0,0,0]。
+    # 正关节角绕 -Y；按实机安装核对电机正方向，反向轴填 -1。
+    yiyou_arm_motor_directions: [1, -1, 1]
+    yiyou_arm_zero_counts: [0, 0, 0]
+    # 空路径使用与仿真一致的内置 300/400 mm、[150,-150,0]° 几何配置。
+    # 可指定同目录的 arm_kinematics.json 或仿真使用的 arm.json。
+    yiyou_arm_kinematics_file: ""
+    yiyou_arm_speed_rpm: 0.6
+    yiyou_arm_acceleration_rpm_s: 1.0
+    # 上电初始化后回到已保存的三轴零位；不设零或写 EEPROM。
+    # 设为 false 时保持启动位置。回零到位后才校准底盘并开放遥控。
+    yiyou_arm_home_on_start: true
+    # 运行后设置 yiyou_arm_target=[x米,z米,pitch弧度]。
