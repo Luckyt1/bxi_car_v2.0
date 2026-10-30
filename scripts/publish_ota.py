@@ -9,7 +9,12 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import sys
+import time
 from urllib import error, parse, request
+
+
+UPLOAD_TASK_TIMEOUT = 15 * 60
+UPLOAD_POLL_INTERVAL = 3
 
 
 class PublishError(RuntimeError):
@@ -73,7 +78,8 @@ class OpenList:
         except (TypeError, ValueError):
             raise PublishError('OpenList and download URLs must use HTTPS without credentials') from None
 
-    def api(self, method, endpoint, payload=None, *, authenticated=True, body=None, headers=None):
+    def api(self, method, endpoint, payload=None, *, authenticated=True, body=None,
+            headers=None, timeout=300):
         outgoing = dict(headers or {})
         if authenticated:
             if not self.token:
@@ -83,21 +89,24 @@ class OpenList:
             body = json.dumps(payload).encode('utf-8')
             outgoing['Content-Type'] = 'application/json'
         req = request.Request(self.site + endpoint, data=body, headers=outgoing, method=method)
+        # Query values can originate in the response (for example a task ID).
+        # Include only the fixed API path in diagnostics, never those values.
+        endpoint_name = endpoint.partition('?')[0]
         try:
-            with self.api_opener.open(req, timeout=300) as response:
+            with self.api_opener.open(req, timeout=timeout) as response:
                 encoded = response.read(2 * 1024 * 1024 + 1)
             if len(encoded) > 2 * 1024 * 1024:
                 raise PublishError('OpenList API response exceeded the size limit')
             result = json.loads(encoded)
         except error.HTTPError as exc:
-            raise PublishError(f'OpenList {endpoint} failed (HTTP {exc.code})') from None
+            raise PublishError(f'OpenList {endpoint_name} failed (HTTP {exc.code})') from None
         except (OSError, error.URLError, http.client.HTTPException, ValueError):
             # Remote error bodies and signed URLs can contain credentials.
-            raise PublishError(f'OpenList {endpoint} failed or returned invalid JSON') from None
+            raise PublishError(f'OpenList {endpoint_name} failed or returned invalid JSON') from None
         if not isinstance(result, dict) or result.get('code') != 200:
             code = result.get('code') if isinstance(result, dict) else None
             code = code if isinstance(code, int) else 'invalid'
-            raise PublishError(f'OpenList {endpoint} failed (code {code})')
+            raise PublishError(f'OpenList {endpoint_name} failed (code {code})')
         return result.get('data')
 
     def login(self, username, password):
@@ -143,14 +152,41 @@ class OpenList:
     def upload(self, file, directory, digest):
         remote = str(PurePosixPath(directory) / file.name)
         with file.open('rb') as stream:
-            self.api('PUT', '/api/fs/put', body=stream, headers={
+            data = self.api('PUT', '/api/fs/put', body=stream, headers={
                 'File-Path': parse.quote(remote, safe='/'),
                 'Content-Type': 'application/octet-stream',
                 'Content-Length': str(file.stat().st_size),
                 'X-File-Sha256': digest,
-                'As-Task': 'false',
+                'As-Task': 'true',
                 'Overwrite': 'false',
             })
+        task = data.get('task') if isinstance(data, dict) else None
+        task_id = task.get('id') if isinstance(task, dict) else None
+        if not isinstance(task_id, str) or not task_id:
+            raise PublishError('OpenList upload returned no task ID')
+        self.wait_for_upload(task_id)
+
+    def wait_for_upload(self, task_id):
+        endpoint = '/api/task/upload/info?' + parse.urlencode({'tid': task_id})
+        deadline = time.monotonic() + UPLOAD_TASK_TIMEOUT
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PublishError('OpenList upload task timed out')
+            task = self.api('POST', endpoint, timeout=min(60, remaining))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PublishError('OpenList upload task timed out')
+            state = task.get('state') if isinstance(task, dict) else None
+            if type(state) is not int or state not in range(10):
+                raise PublishError('OpenList returned an invalid upload task state')
+            # OpenList/tache: 2 succeeds; 4 is canceled; 7 is terminal failure.
+            # Retrying tasks can have an error and 100% progress before success.
+            if state == 2:
+                return
+            if state in (4, 7):
+                raise PublishError('OpenList upload task failed or was canceled')
+            time.sleep(min(UPLOAD_POLL_INTERVAL, remaining))
 
     def verify_public_file(self, file, public_directory, digest):
         # Robots use this unauthenticated API. Checking only with the publisher

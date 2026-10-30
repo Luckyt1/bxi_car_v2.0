@@ -11,7 +11,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from publish_ota import OpenList, PublishError, publish
 
@@ -26,6 +26,13 @@ class Site:
         self.files = {}
         self.events = []
         self.fail_upload = False
+        self.upload_http_code = 200
+        self.omit_task_id = False
+        self.upload_task_states = [2]
+        self.tasks = {}
+        self.task_polls = []
+        self.task_info_code = 200
+        self.task_id_prefix = 'upload-'
         self.private_downloads = False
         self.public_listing = True
         self.hidden_public_files = set()
@@ -50,7 +57,8 @@ class Site:
                 self.wfile.write(body)
 
             def do_POST(self):
-                payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+                payload = json.loads(body) if body else {}
                 site.events.append(('POST', self.path, payload.get('path'),
                                     bool(self.headers.get('Authorization'))))
                 if site.redirect_api:
@@ -100,7 +108,23 @@ class Site:
                 if authorization != site.token:
                     self.respond({'code': 401})
                     return
-                if self.path == '/api/fs/list':
+                if self.path.startswith('/api/task/upload/info?'):
+                    task_id = parse_qs(urlsplit(self.path).query).get('tid', [''])[0]
+                    task = site.tasks.get(task_id)
+                    if task is None:
+                        self.respond({'code': 404})
+                        return
+                    states = task['states']
+                    state = states.pop(0) if len(states) > 1 else states[0]
+                    site.task_polls.append((task_id, state))
+                    if state == 2 and site.task_info_code == 200:
+                        site.files[task['name']] = task['body']
+                    self.respond({'code': site.task_info_code,
+                                  'message': site.token + site.password,
+                                  'data': {'id': task_id, 'state': state,
+                                           'progress': 100, 'status': site.token,
+                                           'error': site.password}})
+                elif self.path == '/api/fs/list':
                     self.respond({'code': site.list_code, 'data': {
                         'content': [{'name': name, 'size': len(data), 'is_dir': False}
                                     for name, data in site.files.items()],
@@ -147,16 +171,21 @@ class Site:
                 site.events.append(('PUT', self.path, path,
                                     bool(self.headers.get('Authorization'))))
                 body = self.rfile.read(int(self.headers['Content-Length']))
-                if (site.fail_upload or self.headers.get('Authorization') != site.token or
+                if site.upload_http_code != 200:
+                    self.respond({'message': site.token}, site.upload_http_code)
+                elif (site.fail_upload or self.headers.get('Authorization') != site.token or
                         self.headers.get('Overwrite') != 'false' or
-                        self.headers.get('As-Task') != 'false' or
+                        self.headers.get('As-Task') != 'true' or
                         self.headers.get('X-File-Sha256') != hashlib.sha256(body).hexdigest()):
                     self.respond({'code': 500, 'message': site.token})
                 elif name in site.files:
                     self.respond({'code': 403, 'message': 'file exists'})
                 else:
-                    site.files[name] = body
-                    self.respond({'code': 200})
+                    task_id = site.task_id_prefix + str(len(site.tasks) + 1)
+                    site.tasks[task_id] = {'name': name, 'body': body,
+                                           'states': list(site.upload_task_states)}
+                    task = {} if site.omit_task_id else {'id': task_id, 'state': 0}
+                    self.respond({'code': 200, 'data': {'task': task}})
 
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         self.url = f'http://127.0.0.1:{self.server.server_port}'
@@ -252,6 +281,73 @@ class PublisherTests(unittest.TestCase):
             self.run_publish()
         self.assertEqual(self.uploads(), ['/' + self.archive.name])
         self.assertNotIn(self.site.token, str(caught.exception))
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_async_upload_waits_through_retries_before_public_verification(self):
+        self.site.upload_task_states = [0, 1, 3, 5, 6, 8, 9, 2]
+        with patch('publish_ota.UPLOAD_POLL_INTERVAL', 0):
+            self.run_publish()
+        self.assertEqual([state for _, state in self.site.task_polls],
+                         self.site.upload_task_states * 2)
+        first_download = next(i for i, event in enumerate(self.site.events)
+                              if event[1] == '/api/fs/get')
+        archive_polls = [i for i, event in enumerate(self.site.events)
+                         if event[1] == '/api/task/upload/info?tid=upload-1']
+        self.assertEqual(len(archive_polls), len(self.site.upload_task_states))
+        self.assertLess(archive_polls[-1], first_download)
+        self.assertIn(self.checksum.name, self.site.files)
+
+    def test_failed_or_canceled_task_does_not_publish_checksum_or_leak_secrets(self):
+        for state in (4, 7):
+            with self.subTest(state=state):
+                self.site.events.clear()
+                self.site.upload_task_states = [1, state]
+                with patch('publish_ota.UPLOAD_POLL_INTERVAL', 0):
+                    with self.assertRaisesRegex(PublishError, 'failed or was canceled') as caught:
+                        self.run_publish()
+                self.assertEqual(self.uploads(), ['/' + self.archive.name])
+                self.assertNotIn(self.checksum.name, self.site.files)
+                self.assertFalse(any(e[1] == '/api/fs/get' for e in self.site.events))
+                self.assertNotIn(self.site.token, str(caught.exception))
+                self.assertNotIn(self.site.password, str(caught.exception))
+
+    def test_pending_task_times_out_without_publishing_checksum(self):
+        self.site.upload_task_states = [1]
+        # Advance only the poller's clock; the HTTP exchange is real and retains
+        # a generous socket timeout even on a loaded CI runner.
+        with patch('publish_ota.time') as clock:
+            clock.monotonic.side_effect = [0, 0, 0.1, 1000000]
+            with self.assertRaisesRegex(PublishError, 'timed out'):
+                self.run_publish()
+        self.assertTrue(self.site.task_polls)
+        self.assertEqual(self.uploads(), ['/' + self.archive.name])
+        self.assertNotIn(self.checksum.name, self.site.files)
+        self.assertFalse(any(e[1] == '/api/fs/get' for e in self.site.events))
+
+    def test_upload_response_without_task_id_cannot_publish_checksum(self):
+        self.site.omit_task_id = True
+        with self.assertRaisesRegex(PublishError, 'no task ID'):
+            self.run_publish()
+        self.assertEqual(self.site.task_polls, [])
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_upload_gateway_timeout_is_not_treated_as_success(self):
+        self.site.upload_http_code = 504
+        with self.assertRaisesRegex(PublishError, 'HTTP 504') as caught:
+            self.run_publish()
+        self.assertEqual(self.site.task_polls, [])
+        self.assertEqual(self.uploads(), ['/' + self.archive.name])
+        self.assertNotIn(self.checksum.name, self.site.files)
+        self.assertNotIn(self.site.token, str(caught.exception))
+
+    def test_task_api_failure_does_not_expose_untrusted_query_or_body(self):
+        self.site.task_id_prefix = self.site.token + ' & ' + self.site.password
+        self.site.task_info_code = 403
+        with self.assertRaisesRegex(PublishError, 'code 403') as caught:
+            self.run_publish()
+        self.assertTrue(self.site.task_polls, 'task IDs must be URL encoded')
+        self.assertNotIn(self.site.token, str(caught.exception))
+        self.assertNotIn(self.site.password, str(caught.exception))
         self.assertNotIn(self.checksum.name, self.site.files)
 
     def test_corrupt_readback_prevents_publication(self):

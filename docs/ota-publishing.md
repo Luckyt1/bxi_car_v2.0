@@ -34,7 +34,10 @@ API 目录 `/`，避免将账号基本路径重复拼接。管理员基本路径
 ## 发布完成与失败处理
 
 发布器先校验本地 SHA-256，并使用与机器人完全相同的匿名目录请求确认目录可访问，
-再同步上传安装包。上传后使用**无登录凭据的公开下载接口**读取整个文件，验证大小和
+再以 `As-Task: true` 上传安装包，避免等待存储完成时触发网关超时。取得任务 ID 后，
+使用同一账号每 3 秒查询上传任务，最多等待 15 分钟；仅任务状态 `2` 视为完成，
+重试中的状态继续等待，取消、终止失败或超时则停止发布。缺少任务 ID 或 HTTP 504
+不会被当作上传成功。任务完成后使用**无登录凭据的公开下载接口**读取整个文件，验证大小和
 SHA-256，并确认匿名目录能列出该包；成功后才上传 `.sha256`。最后验证校验文件，并确认
 同一次匿名目录列表同时包含安装包和校验文件。访客无法列目录或文件被隐藏时，发布失败；
 匿名目录检查不携带需要额外权限的 `refresh` 参数。
@@ -43,6 +46,8 @@ SHA-256，并确认匿名目录能列出该包；成功后才上传 `.sha256`。
 
 同名文件已经存在时，发布器验证其内容；相同则跳过，不同则失败。上传请求设置
 `Overwrite: false`，不会覆盖已发布包。安装包上传失败或未通过校验时，不会发布校验文件。
+校验文件同样等待异步上传任务完成；任务超时后后台可能仍会继续上传安装包，但单独的
+安装包不会进入可安装版本列表。任务接口只查询当前账号自己创建的任务，无需管理员权限。
 下载站 API 不跟随重定向；公开下载只允许 HTTPS，且不会向存储服务或 CDN 传递发布 token。
 
 版本包更新 `/opt/bxi/car2`，实机配置、标定和位置记忆仍留在 `/var/lib/bxi/car2`。
@@ -58,6 +63,7 @@ python3 scripts/publish_ota.py \
 ```
 
 参考：[OpenList 流式上传实现](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/fsup.go)、
+[OpenList 上传任务接口](https://github.com/OpenListTeam/OpenList/blob/e3c664f/server/handles/task.go)、
 [OpenList 路径约束](https://github.com/OpenListTeam/OpenList/blob/main/pkg/utils/path.go)、
 [GitHub Actions Secrets](https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions)、
 [官方 ROS 容器](https://hub.docker.com/_/ros)。
