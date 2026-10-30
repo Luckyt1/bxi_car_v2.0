@@ -89,7 +89,7 @@ jobs:
           RELEASE_VERSION: ${{ steps.package.outputs.version }}
           GIT_TERMINAL_PROMPT: '0'
         run: |
-          current_main="$(timeout 30 git ls-remote origin refs/heads/main | cut -f1)"
+          current_main="$(timeout 30 git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" refs/heads/main | cut -f1)"
           if [[ "$current_main" != "$GITHUB_SHA" ]]; then
             echo '::notice::A newer main commit exists; this archive will not replace its OTA release.'
             exit 0
