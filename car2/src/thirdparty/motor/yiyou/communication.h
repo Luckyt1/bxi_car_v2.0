@@ -23,6 +23,8 @@ public:
   virtual iswv::Result<void> download_blocking(
     iswv::canopen::ObjectAddress object, const std::uint8_t * data, std::size_t size,
     iswv::canopen::SdoOptions options = {}) = 0;
+  virtual std::optional<std::int16_t> cached_torque_permille() const {return {};}
+  virtual std::optional<std::uint32_t> cached_rated_torque_millinewton_meter() const {return {};}
 
   template<typename T>
   iswv::Result<T> read(
@@ -51,6 +53,7 @@ struct Options
   // Physical chain positions (1 based), not CAN Node-IDs. Maximum 199 for SOEM 1.4.
   std::vector<std::uint16_t> slaves;
   std::optional<std::uint16_t> cst_slave {};
+  bool monitor_torque{false};
 };
 
 // Pure argument validation, before a caller opens the shared motor power switch.

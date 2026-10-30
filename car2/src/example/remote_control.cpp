@@ -28,7 +28,8 @@
 #include "geometry_msgs/msg/twist.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "rcl_interfaces/srv/get_parameters.hpp"
-#include "rcl_interfaces/msg/parameter.hpp"
+#include "std_msgs/msg/int8.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "rcl_interfaces/srv/set_parameters_atomically.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "yaml-cpp/yaml.h"
@@ -109,12 +110,12 @@ public:
         throw std::invalid_argument("arm translation/pitch steps must be finite and positive");
       }
       const auto arm_node = declare_parameter<std::string>("arm_node", "/chassis", descriptor);
-      arm_current_permille_ = declare_parameter<int>("arm_current_permille", 50, descriptor);
-      if (arm_current_permille_ < 1 || arm_current_permille_ > 1000) {
-        throw std::invalid_argument("arm_current_permille must be in [1,1000]");
+      if (declare_parameter<int>("arm_current_permille", 0, descriptor) != 0) {
+        throw std::invalid_argument(
+                "arm_current_permille is retired; fourth-axis controls now use position jog");
       }
-      arm_current_publisher_ = create_publisher<rcl_interfaces::msg::Parameter>(
-        declare_parameter<std::string>("arm_current_topic", "/arm_motor4_current", descriptor),
+      arm_jog_publisher_ = create_publisher<std_msgs::msg::Int8>(
+        declare_parameter<std::string>("arm_position_topic", "/arm_motor4_jog", descriptor),
         rclcpp::QoS(1).lifespan(rclcpp::Duration::from_seconds(0.1)));
       const int speech_domain = declare_parameter<int>("arm_speech_domain_id", -1, descriptor);
       if (speech_domain < -1 || speech_domain > 232) {
@@ -173,11 +174,25 @@ public:
       "start_chassis", session_ != nullptr, startup_descriptor);
     start_button_ = declare_parameter<int>("start_button", 14, startup_descriptor);
     if (enable_arm_controls_) {
+      arm_tracking_button_ = declare_parameter<int>(
+        "arm_tracking_button", 6, startup_descriptor);
+      if (arm_tracking_button_ < 0 || arm_tracking_button_ > 255 ||
+        arm_tracking_button_ == 0 || arm_tracking_button_ == 1 ||
+        arm_tracking_button_ == 3 || arm_tracking_button_ == 4 ||
+        arm_tracking_button_ == enable_button_ || arm_tracking_button_ == stop_button_ ||
+        arm_tracking_button_ == emergency_stop_button_ ||
+        arm_tracking_button_ == start_button_)
+      {
+        throw std::invalid_argument("invalid or conflicting arm_tracking_button");
+      }
+      arm_tracking_publisher_ = create_publisher<std_msgs::msg::Bool>(
+        "/arm_tracking_requested", rclcpp::QoS(1).reliable().durability_volatile()
+        .lifespan(rclcpp::Duration::from_seconds(0.25)));
       for (const int button : {enable_button_, stop_button_, emergency_stop_button_,
           start_chassis ? start_button_ : -1})
       {
         if (button == 0 || button == 4) {
-          throw std::invalid_argument("buttons 0/4 are reserved for fourth-axis current");
+          throw std::invalid_argument("buttons 0/4 are reserved for fourth-axis position jog");
         }
       }
     }
@@ -264,9 +279,13 @@ public:
         arm_translation_step_m_, arm_pitch_step_rad_, invert_arm_direction_ ? "true" : "false",
         get_parameter("arm_node").as_string().c_str());
       RCLCPP_INFO(
-        get_logger(), "Arm current: hold button0=+%d, button4=-%d rated-current permille; "
-        "release or both pressed=0; release both before use; button11 remains emergency stop",
-        arm_current_permille_, arm_current_permille_);
+        get_logger(), "Arm position: hold button0=positive, button4=negative; "
+        "release or both pressed=halt and hold; release both before use; "
+        "button11 remains emergency stop");
+      RCLCPP_INFO(
+        get_logger(), "Arm tracking: button%d toggles visual height and chassis lateral tracking "
+        "after startup with centered chassis sticks; press again or move a chassis stick to "
+        "cancel; the vision process must be running", arm_tracking_button_);
     } else {
       RCLCPP_INFO(get_logger(), "Chassis-only remote: Cartesian arm controls disabled");
     }
@@ -293,6 +312,31 @@ private:
   bool startup_pending() const
   {
     return session_ && session_->stage != RemoteControlSession::Stage::running;
+  }
+
+  void publish_arm_tracking_request()
+  {
+    if (!arm_tracking_publisher_) {return;}
+    std_msgs::msg::Bool message;
+    message.data = arm_tracking_requested_;
+    arm_tracking_publisher_->publish(message);
+  }
+
+  void set_arm_tracking_requested(bool requested, const char * reason)
+  {
+    arm_tracking_toggle_pending_ = false;
+    if (arm_tracking_requested_ == requested) {return;}
+    arm_tracking_requested_ = requested;
+    arm_joystick_.disarm();
+    cancel_arm_adjustment(reason);
+    RCLCPP_INFO(get_logger(), "ARM_TRACKING requested=%s: %s",
+      requested ? "true" : "false", reason);
+  }
+
+  void cancel_arm_tracking(const char * reason)
+  {
+    set_arm_tracking_requested(false, reason);
+    publish_arm_tracking_request();
   }
 
   static const char * arm_coordinate_name(unsigned coordinate)
@@ -340,7 +384,9 @@ private:
       message.data = speech.at(action.coordinate);
       arm_speech_publisher_->publish(message);
     }
-    if (joystick_armed_ && action.direction != 0 && !arm_busy() && !arm_action_) {
+    if (joystick_armed_ && !arm_tracking_requested_ && action.direction != 0 &&
+      !arm_busy() && !arm_action_)
+    {
       arm_action_ = action;
     }
   }
@@ -473,26 +519,26 @@ private:
     return current + diff;
   }
 
-  void update_arm_current(bool enabled)
+  void update_arm_jog(bool enabled)
   {
     if (!enable_arm_controls_) {return;}
     const bool positive = button_pressed(0);
     const bool negative = button_pressed(4);
     if (!enabled || !arm_feedback_fresh() || (positive && negative)) {
-      arm_current_ready_ = false;
-    } else if (arm_current_seen_[0] && arm_current_seen_[1] && !positive && !negative) {
-      arm_current_ready_ = true;
+      arm_jog_ready_ = false;
+    } else if (arm_jog_seen_[0] && arm_jog_seen_[1] && !positive && !negative) {
+      arm_jog_ready_ = true;
     }
-    const int target = arm_current_ready_ && enabled && positive != negative ?
-      (positive ? arm_current_permille_ : -arm_current_permille_) : 0;
-    if (target != 0 || last_arm_current_ != 0) {
-      arm_current_publisher_->publish(
-        rclcpp::Parameter("yiyou_motor_4_current_permille", target).to_parameter_msg());
-      if (target != last_arm_current_) {
-        RCLCPP_INFO(get_logger(), "ARM_CURRENT_REMOTE target_current_permille=%d", target);
-      }
+    const int direction = arm_jog_ready_ && enabled && positive != negative ?
+      (positive ? 1 : -1) : 0;
+    std_msgs::msg::Int8 message;
+    message.data = static_cast<std::int8_t>(direction);
+    // Neutral refreshes also let a restarted or timed-out receiver rearm safely.
+    arm_jog_publisher_->publish(message);
+    if (direction != last_arm_jog_) {
+      RCLCPP_INFO(get_logger(), "ARM_POSITION_REMOTE jog_direction=%d", direction);
     }
-    last_arm_current_ = target;
+    last_arm_jog_ = direction;
   }
   static double normalize_axis(int16_t value)
   {
@@ -547,15 +593,22 @@ private:
       joy_fd_ = -1;
       throw std::invalid_argument("joystick does not provide the configured start/stop buttons");
     }
+    if (enable_arm_controls_ && arm_tracking_button_ >= button_count) {
+      close(joy_fd_);
+      joy_fd_ = -1;
+      throw std::invalid_argument("joystick does not provide arm_tracking_button");
+    }
 
     start_released_ = false;
     emergency_stop_released_ = false;
+    arm_tracking_released_ = false;
+    arm_tracking_toggle_pending_ = false;
     axes_.assign(axis_count, 0.0);
     axis_seen_.assign(axis_count, false);
     joystick_armed_ = false;
     arm_joystick_.reset();
-    arm_current_ready_ = false;
-    arm_current_seen_.fill(false);
+    arm_jog_ready_ = false;
+    arm_jog_seen_.fill(false);
     buttons_.assign(button_count, 0);
     RCLCPP_INFO(
       get_logger(), "Opened joystick with %u axes and %u buttons", axis_count, button_count);
@@ -608,6 +661,8 @@ private:
     joystick_armed_ = false;
     start_released_ = false;
     emergency_stop_released_ = false;
+    arm_tracking_released_ = false;
+    cancel_arm_tracking(reason);
     axes_.clear();
     axis_seen_.clear();
     buttons_.clear();
@@ -620,9 +675,9 @@ private:
       }
     }
     arm_joystick_.reset();
-    arm_current_seen_.fill(false);
-    arm_current_ready_ = false;
-    update_arm_current(false);
+    arm_jog_seen_.fill(false);
+    arm_jog_ready_ = false;
+    update_arm_jog(false);
     cancel_arm_adjustment(reason);
     target_twist_ = geometry_msgs::msg::Twist();
   }
@@ -649,17 +704,30 @@ private:
         }
       }
     } else if (type == JS_EVENT_BUTTON && event.number < buttons_.size()) {
+      const bool was_pressed = button_pressed(event.number);
       buttons_[event.number] = event.value;
+      if (enable_arm_controls_ && static_cast<int>(event.number) == arm_tracking_button_) {
+        const bool was_released = arm_tracking_released_;
+        arm_tracking_released_ = event.value == 0;
+        if ((event.type & JS_EVENT_INIT) != 0) {
+          cancel_arm_tracking("joystick initialization");
+        } else if (event.value != 0 && !was_pressed && was_released && !startup_pending()) {
+          // Preserve every edge when multiple presses arrive in one timer tick.
+          // Apply their parity only after the full link, startup and input gates.
+          arm_tracking_toggle_pending_ = !arm_tracking_toggle_pending_;
+        }
+      }
       if (enable_arm_controls_ && (event.number == 0 || event.number == 4)) {
-        arm_current_seen_[event.number == 0 ? 0 : 1] = true;
+        arm_jog_seen_[event.number == 0 ? 0 : 1] = true;
         if ((event.type & JS_EVENT_INIT) != 0 || (button_pressed(0) && button_pressed(4))) {
-          update_arm_current(false);
+          update_arm_jog(false);
         }
       }
       if ((static_cast<int>(event.number) == stop_button_ && event.value != 0) ||
         (static_cast<int>(event.number) == enable_button_ && event.value == 0))
       {
-        update_arm_current(false);
+        cancel_arm_tracking("stop/enable button");
+        update_arm_jog(false);
         arm_joystick_.disarm();
         cancel_arm_adjustment("stop/enable button");
       }
@@ -703,7 +771,8 @@ private:
   void emergency_stop()
   {
     emergency_stopped_ = true;
-    update_arm_current(false);
+    cancel_arm_tracking("emergency stop");
+    update_arm_jog(false);
     arm_joystick_.disarm();
     cancel_arm_adjustment("emergency stop");
     publish_zero_velocity();
@@ -764,6 +833,7 @@ private:
   void timer_callback()
   {
     arm_action_.reset();
+    arm_tracking_toggle_pending_ = false;
     // Read only a snapshot here: a stalled Bluetooth request must never block zero output.
     const auto link = link_monitor_->snapshot();
     if (!link.healthy) {
@@ -774,6 +844,7 @@ private:
       }
       if (joy_fd_ >= 0 || link_was_healthy_) {invalidate_joystick("joystick link lost");}
       link_was_healthy_ = false;
+      cancel_arm_tracking("joystick link lost");
       publish_zero_velocity();
       return;
     }
@@ -802,7 +873,8 @@ private:
     }
 
     if (startup_pending()) {
-      update_arm_current(false);
+      cancel_arm_tracking("startup pending");
+      update_arm_jog(false);
       joystick_armed_ = false;
       arm_joystick_.disarm();
       arm_action_.reset();
@@ -819,7 +891,8 @@ private:
         RCLCPP_WARN(get_logger(), "Joystick input timed out: zero velocity; recenter to resume");
       }
       joystick_armed_ = false;
-      update_arm_current(false);
+      cancel_arm_tracking("joystick unavailable");
+      update_arm_jog(false);
       arm_joystick_.disarm();
       cancel_arm_adjustment("joystick unavailable");
       publish_zero_velocity();
@@ -844,22 +917,43 @@ private:
       }
     }
     if (!joystick_armed_) {
-      update_arm_current(false);
+      cancel_arm_tracking("joystick not centered");
+      update_arm_jog(false);
       arm_joystick_.disarm();
       cancel_arm_adjustment("joystick not centered");
       publish_zero_velocity();
       return;
     }
-    update_arm_current(
+    update_arm_jog(
       !button_pressed(stop_button_) &&
       (enable_button_ < 0 || button_pressed(enable_button_)));
     if (button_pressed(stop_button_) ||
       (enable_button_ >= 0 && !button_pressed(enable_button_)))
     {
+      cancel_arm_tracking("joystick inactive");
       arm_joystick_.disarm();
       cancel_arm_adjustment("joystick inactive");
     } else if (enable_arm_controls_) {
-      if (!arm_joystick_.armed() && !arm_joystick_.arm()) {
+      const bool chassis_centered =
+        chassis::remote_apply_deadzone(axis_value(axis_linear_), deadzone_) == 0.0 &&
+        chassis::remote_apply_deadzone(axis_value(axis_lateral_), deadzone_) == 0.0 &&
+        chassis::remote_apply_deadzone(axis_value(axis_angular_), deadzone_) == 0.0;
+      if (arm_tracking_toggle_pending_) {
+        if (arm_tracking_requested_ || chassis_centered) {
+          set_arm_tracking_requested(!arm_tracking_requested_, "tracking button pressed");
+          if (arm_tracking_requested_) {publish_zero_velocity();}
+        } else {
+          cancel_arm_tracking("center chassis sticks before starting visual tracking");
+        }
+      }
+      if (arm_tracking_requested_ && !chassis_centered) {
+        cancel_arm_tracking("manual chassis intervention; recenter to resume manual control");
+      }
+      publish_arm_tracking_request();
+      if (arm_tracking_requested_) {
+        arm_joystick_.disarm();
+        arm_action_.reset();
+      } else if (!arm_joystick_.armed() && !arm_joystick_.arm()) {
         cancel_arm_adjustment("Arm controls not neutral");
       } else {
         // Finish the previous response first so a ready 100 ms repeat can start
@@ -871,6 +965,10 @@ private:
           update_arm_adjustment();
         }
       }
+    }
+    if (arm_tracking_requested_) {
+      publish_zero_velocity();
+      return;
     }
     // Update once per timer tick, including ticks without joystick events.
     update_target_twist(filter_dt_s);
@@ -899,6 +997,11 @@ private:
   std::shared_ptr<RemoteControlSession> session_;
   const bool enable_arm_controls_;
   int start_button_{14};
+  int arm_tracking_button_{6};
+  bool arm_tracking_released_{false};
+  bool arm_tracking_toggle_pending_{false};
+  bool arm_tracking_requested_{false};
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr arm_tracking_publisher_;
   bool start_released_{false};
   bool emergency_stop_released_{false};
   bool calibration_finish_pending_{false};
@@ -956,14 +1059,13 @@ private:
   double arm_translation_step_m_{0.01};
   double arm_pitch_step_rad_{0.017453292519943295};
   bool invert_arm_direction_{false};
-  rclcpp::Publisher<rcl_interfaces::msg::Parameter>::SharedPtr arm_current_publisher_;
+  rclcpp::Publisher<std_msgs::msg::Int8>::SharedPtr arm_jog_publisher_;
   rclcpp::Context::SharedPtr arm_speech_context_;
   rclcpp::Node::SharedPtr arm_speech_node_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr arm_speech_publisher_;
-  int arm_current_permille_{50};
-  int last_arm_current_{0};
-  bool arm_current_ready_{false};
-  std::array<bool, 2> arm_current_seen_{};
+  int last_arm_jog_{0};
+  bool arm_jog_ready_{false};
+  std::array<bool, 2> arm_jog_seen_{};
 };
 
 }  // namespace

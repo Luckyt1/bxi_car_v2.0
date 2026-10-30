@@ -156,43 +156,23 @@ void YiyouMotor::enable_position(
   enable_mode(iswv::cia402::OperationMode::profile_position, velocity, acceleration, deceleration);
 }
 
-void YiyouMotor::disable_for_configuration()
-{
-  check(drive_.write_control(0), "disable voltage");
-  check(
-    drive_.wait_for_status(
-      [](std::uint16_t status) {
-        return iswv::cia402::decode_state(status) ==
-        iswv::cia402::DriveState::switch_on_disabled;
-      }, 1000ms), "wait for disabled state (check fault/STO if timeout)");
-}
-
-void YiyouMotor::wait_for_mode_display(const char * operation)
-{
-  const auto deadline = std::chrono::steady_clock::now() + 1s;
-  while (true) {
-    const auto displayed = node_->read(mode_display);
-    check(displayed, operation);
-    if (displayed.value() == static_cast<std::int8_t>(mode_)) {return;}
-    if (std::chrono::steady_clock::now() >= deadline) {
-      throw std::runtime_error(
-              "timeout waiting for 0x6061=" +
-              std::to_string(static_cast<int>(mode_)) + "; last mode=" +
-              std::to_string(static_cast<int>(displayed.value())));
-    }
-    std::this_thread::sleep_for(10ms);
-  }
-}
-
 void YiyouMotor::enable_cst()
 {
   if (active_) {throw std::logic_error("stop the motor before reconfiguring");}
   position_target_.reset();
+  position_command_ = PositionCommand::idle;
+  position_halted_ = false;
   select_ethercat_control();
   mode_ = cst_mode;
   active_ = true;  // 初始化中途失败也由 stop() 清理。
   try {
-    disable_for_configuration();
+    check(drive_.write_control(0), "disable voltage");
+    check(
+      drive_.wait_for_status(
+        [](std::uint16_t status) {
+          return iswv::cia402::decode_state(status) ==
+          iswv::cia402::DriveState::switch_on_disabled;
+        }, 1000ms), "wait for disabled state (check fault/STO if timeout)");
     check(node_->write(target_current, static_cast<std::int16_t>(0)), "clear 0x6071");
     const auto confirmed_current = node_->read(target_current);
     check(confirmed_current, "verify target current 0x6071");
@@ -206,7 +186,18 @@ void YiyouMotor::enable_cst()
       throw std::runtime_error("0x60B2 torque offset did not clear; no enable sent");
     }
     check(drive_.set_mode(mode_), "set CST operation mode 0x6060=10");
-    wait_for_mode_display("read 0x6061 while waiting for CST mode");
+    const auto mode_deadline = std::chrono::steady_clock::now() + 1s;
+    while (true) {
+      const auto displayed = node_->read(mode_display);
+      check(displayed, "read 0x6061 while waiting for CST mode");
+      if (displayed.value() == static_cast<std::int8_t>(mode_)) {break;}
+      if (std::chrono::steady_clock::now() >= mode_deadline) {
+        throw std::runtime_error(
+                "timeout waiting for 0x6061=10; last mode=" +
+                std::to_string(static_cast<int>(displayed.value())));
+      }
+      std::this_thread::sleep_for(10ms);
+    }
     check(drive_.enable(), "CiA402 enable CST (0x06 -> 0x07 -> 0x0F)");
     enabled_ = true;
     check_current_mode();
@@ -228,11 +219,19 @@ void YiyouMotor::enable_mode(
   }
   if (active_) {throw std::logic_error("stop the motor before reconfiguring");}
   position_target_.reset();
+  position_command_ = PositionCommand::idle;
+  position_halted_ = false;
   select_ethercat_control();
   mode_ = mode;
   active_ = true;  // 初始化中途失败也由 stop() 清理。
   try {
-    disable_for_configuration();
+    check(drive_.write_control(0), "disable voltage");
+    check(
+      drive_.wait_for_status(
+        [](std::uint16_t status) {
+          return iswv::cia402::decode_state(status) ==
+          iswv::cia402::DriveState::switch_on_disabled;
+        }, 1000ms), "wait for disabled state (check fault/STO if timeout)");
     if (mode_ == iswv::cia402::OperationMode::profile_position) {
       // 先覆盖历史目标；使能和 bit4 上升沿之前均不允许追逐旧位置。
       check(node_->write(target_position, actual_position()), "seed 0x607A with current position");
@@ -241,7 +240,19 @@ void YiyouMotor::enable_mode(
       check(node_->write(target_velocity, 0), "clear 0x60FF");
     }
     check(drive_.set_mode(mode_), "set operation mode 0x6060");
-    wait_for_mode_display("read 0x6061 while waiting for operation mode");
+    const auto mode_deadline = std::chrono::steady_clock::now() + 1s;
+    while (true) {
+      const auto displayed = node_->read(mode_display);
+      check(displayed, "read 0x6061 while waiting for operation mode");
+      if (displayed.value() == static_cast<std::int8_t>(mode_)) {break;}
+      if (std::chrono::steady_clock::now() >= mode_deadline) {
+        throw std::runtime_error(
+                "timeout waiting for 0x6061=" +
+                std::to_string(static_cast<int>(mode_)) + "; last mode=" +
+                std::to_string(static_cast<int>(displayed.value())));
+      }
+      std::this_thread::sleep_for(10ms);
+    }
     check(node_->write(profile_acceleration, acceleration), "write 0x6083");
     check(node_->write(profile_deceleration, deceleration), "write 0x6084");
     check(drive_.enable(), "CiA402 enable (0x06 -> 0x07 -> 0x0F)");
@@ -394,6 +405,24 @@ std::int16_t YiyouMotor::actual_current_permille()
   return current.value();
 }
 
+std::optional<std::int16_t> YiyouMotor::actual_torque_permille() const
+{
+  return node_->cached_torque_permille();
+}
+
+std::optional<std::uint32_t> YiyouMotor::rated_torque_millinewton_meter() const
+{
+  return node_->cached_rated_torque_millinewton_meter();
+}
+
+std::optional<double> YiyouMotor::actual_torque_newton_meter() const
+{
+  const auto permille = actual_torque_permille();
+  const auto rated_mnm = rated_torque_millinewton_meter();
+  if (!permille || !rated_mnm || *rated_mnm == 0) {return {};}
+  return static_cast<double>(*permille) * static_cast<double>(*rated_mnm) / 1000000.0;
+}
+
 std::uint16_t YiyouMotor::position_status()
 {
   if (!enabled_ || mode_ != iswv::cia402::OperationMode::profile_position) {
@@ -441,7 +470,9 @@ void YiyouMotor::move_to_position(std::int32_t position)
   position_target_.reset();
   try {
     (void)position_status();
-    check(drive_.write_control(iswv::cia402::control::absolute_prepare), "PP clear new set-point");
+    check(
+      drive_.write_control(iswv::cia402::control::absolute_prepare |
+      (position_halted_ ? 0x0100 : 0)), "PP clear new set-point");
     wait_for_position_ack(false);
     check(node_->write(target_position, position), "write 0x607A");
     const auto confirmed = node_->read(target_position);
@@ -452,6 +483,7 @@ void YiyouMotor::move_to_position(std::int32_t position)
     check(
       drive_.write_control(
         iswv::cia402::control::absolute_start), "PP new set-point rising edge");
+    position_halted_ = false;
     wait_for_position_ack(true);
     check(drive_.write_control(iswv::cia402::control::absolute_prepare), "PP reset new set-point");
     wait_for_position_ack(false);
@@ -471,7 +503,9 @@ void YiyouMotor::prepare_position_command(std::int32_t position)
     throw std::logic_error("PP command is still pending");
   }
   (void)position_status();
-  check(drive_.write_control(iswv::cia402::control::absolute_prepare), "PP clear new set-point");
+  check(
+    drive_.write_control(iswv::cia402::control::absolute_prepare |
+    (position_halted_ ? 0x0100 : 0)), "PP clear new set-point");
   pending_position_ = position;
   position_command_ = PositionCommand::clearing;
 }
@@ -482,7 +516,9 @@ bool YiyouMotor::stage_position_command()
     throw std::logic_error("PP command was not prepared");
   }
   if ((position_status() & iswv::cia402::status::mode_specific_12) != 0) {return false;}
-  check(node_->write(target_position, pending_position_, {5ms}), "stage 0x607A");
+  // PDO delivery may need the next two 2 ms cycles after a transient lost frame.
+  // Keep mailbox readback separate; its timeout remains 5 ms.
+  check(node_->write(target_position, pending_position_, {10ms}), "stage 0x607A");
   const auto confirmed = node_->read(target_position, {5ms});
   check(confirmed, "verify staged 0x607A");
   if (confirmed.value() != pending_position_) {
@@ -499,6 +535,7 @@ void YiyouMotor::trigger_position_command()
   }
   (void)position_status();
   check(drive_.write_control(iswv::cia402::control::absolute_start), "PP trigger staged target");
+  position_halted_ = false;
   position_target_.reset();
   position_command_ = PositionCommand::triggered;
 }
@@ -523,6 +560,26 @@ bool YiyouMotor::finish_position_command()
   position_target_ = pending_position_;
   position_command_ = PositionCommand::idle;
   return true;
+}
+
+void YiyouMotor::halt_position()
+{
+  if (!enabled_ || mode_ != iswv::cia402::OperationMode::profile_position) {
+    throw std::logic_error("position halt requires enabled PP mode");
+  }
+  // Cancel first: even a failed write or late acknowledge cannot revive this target.
+  position_command_ = PositionCommand::idle;
+  position_target_.reset();
+  position_halted_ = true;
+  check(
+    drive_.write_control(iswv::cia402::control::absolute_prepare | 0x0100),
+    "PP halt and clear new set-point");
+  (void)position_status();
+}
+
+void YiyouMotor::check_position_mode()
+{
+  (void)position_status();
 }
 
 bool YiyouMotor::position_reached(std::uint32_t tolerance_pulses)
@@ -631,6 +688,7 @@ void YiyouMotor::stop()
 {
   position_command_ = PositionCommand::idle;
   position_target_.reset();
+  position_halted_ = false;
   if (!active_) {return;}
   std::exception_ptr failure;
   try {

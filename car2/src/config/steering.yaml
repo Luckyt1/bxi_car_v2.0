@@ -6,13 +6,13 @@ chassis:
     hardware_config_file: steering_hardware.yaml
 
     # 四个行走轮统一设置（输出轴 RPM；轮缘加减速度 m/s²）。
-    drive_max_output_rpm: 105.0
+    drive_max_output_rpm: 300.0
     drive_acceleration_m_s2: 2.0
-    drive_deceleration_m_s2: 2.4
+    drive_deceleration_m_s2: 2.0
 
     # 舵轮转向角速度 rad/s；整车 yaw 变化率 rad/s²。
     steering_rate_limit_rad_s: 4.0
-    command_yaw_acceleration_rad_s2: 0.8
+    command_yaw_acceleration_rad_s2: 4
 
     # 整车 x/y/yaw 速度绝对值上限，适用于遥控和 /cmd_vel_car。
     # 0 保持原行为（仅受轮速限制）；设为正数启用，例如 0.6、0.6、0.4。
@@ -26,7 +26,7 @@ remote_ctrl:
     # 遥控满杆 x/y 速度 m/s、yaw 角速度 rad/s。
     scale_linear: 0.6
     scale_lateral: 0.6
-    scale_angular: 0.4
+    scale_angular: 1.0
     # 遥控 x/y 指令变化率 m/s²，沿用现有算法：正向变化 / 负向变化。
-    max_accel: 1.2
-    max_decel: 2.4
+    max_accel: 2.0
+    max_decel: 2.0

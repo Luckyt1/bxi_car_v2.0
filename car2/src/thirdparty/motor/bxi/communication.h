@@ -4,7 +4,7 @@
 // Changes: standalone API, explicit frame flags, input and feedback validation.
 #pragma once
 
-#include "bxi/transport.h"
+#include "iswv/transport.hpp"
 
 #include <array>
 #include <cstdint>
@@ -61,14 +61,14 @@ struct Feedback
 
 /// 合法参数沿用上游量化截断；范围须有限且 min < max。
 /// 无效范围、越界、非有限值和 FA..FE 特殊控制帧碰撞返回 invalid_argument。
-bxi::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command);
+iswv::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command);
 
 /// 要求有效标准数据帧、至少 5 字节；无效输入返回 protocol_error。
 /// 仅解析位置和速度，不改写接收回调。
 /// 使用与命令相同的范围；只校验位置和速度范围，无效范围返回 invalid_argument。
 /// 调用方按设备 master_id 路由；官网默认 can_id | 0x010，也允许单独修改。
-bxi::Result<Feedback> decode_feedback(
-  const bxi::CanFrame & frame, const EncodingRanges & ranges = {});
+iswv::Result<Feedback> decode_feedback(
+  const iswv::CanFrame & frame, const EncodingRanges & ranges = {});
 
 struct FrameOptions
 {
@@ -78,8 +78,8 @@ struct FrameOptions
 
 /// Send an already encoded MIT payload; success only means transport acceptance.
 /// Invalid standard IDs or FD/BRS options are rejected before transmission.
-bxi::Result<void> send_payload(
-  bxi::ICanTransport & transport, std::uint32_t command_id, FrameOptions options,
+iswv::Result<void> send_payload(
+  iswv::ICanTransport & transport, std::uint32_t command_id, FrameOptions options,
   const std::array<std::uint8_t, 8> & payload);
 
 }  // namespace bxi

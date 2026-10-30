@@ -27,6 +27,12 @@ public:
     timeout_reported_ = false;
   }
 
+  bool has_fresh_command(Clock::time_point now) const
+  {
+    return last_command_ && now >= *last_command_ &&
+           std::chrono::duration<double>(now - *last_command_) < timeout_;
+  }
+
   bool consume_timeout(Clock::time_point now)
   {
     if (!last_command_ || timeout_reported_) {return false;}

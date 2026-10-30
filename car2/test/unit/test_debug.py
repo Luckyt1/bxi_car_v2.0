@@ -26,7 +26,7 @@ def load_module(name, path):
 
 
 debug = load_module("debug_entry_test", ROOT / "test" / "debug.py")
-yiyou = load_module("yiyou_entry_test", ROOT / "test" / "tools" / "yiyou_control.py")
+yiyou = load_module("yiyou_entry_test", ROOT / "tools" / "yiyou_control.py")
 
 
 class DebugMenuTests(unittest.TestCase):
@@ -141,6 +141,196 @@ class DebugMenuTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class YiyouConnectionSelectionTests(unittest.TestCase):
+    def select(self, argv=(), inputs=(), interfaces=("enp1s0", "enp2s0"), environment=None):
+        args = yiyou.parse_args(["jog", *argv])
+        with mock.patch.dict(os.environ, environment or {}, clear=True), \
+                mock.patch.object(yiyou, "available_interfaces", return_value=list(interfaces)) as scan, \
+                mock.patch("builtins.input", side_effect=inputs) as prompt, \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = yiyou.select_connection(args)
+        return result, args, prompt, scan
+
+    def test_jog_defers_missing_connection_parameters_but_home_requires_them(self):
+        args = yiyou.parse_args(["jog"])
+        self.assertIsNone(args.interface)
+        self.assertIsNone(args.slaves)
+        for argv in [["home"], ["home", "--interface", "enp1s0"],
+                     ["home", "--slaves", "1"]]:
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    yiyou.parse_args(argv)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_available_interfaces_excludes_loopback_wireless_and_virtual_devices(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ["enp2s0", "lo", "wlan0", "veth0", "enp1s0"]:
+                (root / name).mkdir()
+                if name != "veth0":
+                    (root / name / "device").mkdir()
+            (root / "wlan0" / "wireless").mkdir()
+            entries = list(root.iterdir())
+            with mock.patch.object(Path, "iterdir", return_value=iter(entries)):
+                self.assertCountEqual(yiyou.available_interfaces(), ["enp1s0", "enp2s0"])
+
+    def test_selects_interface_by_number_and_multiple_physical_slave_positions(self):
+        result, args, prompt, scan = self.select(inputs=["2", "1, 3,199"])
+        self.assertTrue(result)
+        self.assertEqual(args.interface, "enp2s0")
+        self.assertEqual(args.slaves, [1, 3, 199])
+        self.assertEqual(prompt.call_count, 2)
+        scan.assert_called_once_with()
+
+    def test_invalid_interface_and_duplicate_or_out_of_range_slaves_reprompt(self):
+        result, args, prompt, _ = self.select(
+            inputs=["wrong", "3", "-1", "1", "1,1", "0", "200", "1,,2", "1,abc", "2,4"])
+        self.assertTrue(result)
+        self.assertEqual(args.interface, "enp1s0")
+        self.assertEqual(args.slaves, [2, 4])
+        self.assertEqual(prompt.call_count, 10)
+
+    def test_enter_accepts_existing_environment_default_or_only_interface(self):
+        cases = [(["enp1s0", "enp2s0"], {"YIYOU_INTERFACE": "enp2s0", "YIYOU_SLAVES": "2,199"},
+                  "enp2s0", [2, 199]),
+                 (["enp1s0"], {}, "enp1s0", [1, 2, 3]),
+                 (["enp1s0", "enp86s0"], {}, "enp86s0", [1, 2, 3])]
+        for interfaces, environment, expected_interface, expected_slaves in cases:
+            with self.subTest(interfaces=interfaces, environment=environment):
+                result, args, _, _ = self.select(
+                    inputs=["", ""], interfaces=interfaces, environment=environment)
+                self.assertTrue(result)
+                self.assertEqual(args.interface, expected_interface)
+                self.assertEqual(args.slaves, expected_slaves)
+
+    def test_missing_environment_default_cannot_select_an_unlisted_interface(self):
+        result, args, prompt, _ = self.select(
+            inputs=["", "2", "1"], environment={"YIYOU_INTERFACE": "missing0"})
+        self.assertTrue(result)
+        self.assertEqual(args.interface, "enp2s0")
+        self.assertEqual(prompt.call_count, 3)
+
+    def test_invalid_environment_slave_default_requires_valid_input(self):
+        result, args, prompt, _ = self.select(
+            argv=["--interface", "enp1s0"], inputs=["", "3,4"],
+            environment={"YIYOU_SLAVES": "1,1"})
+        self.assertTrue(result)
+        self.assertEqual(args.slaves, [3, 4])
+        self.assertEqual(prompt.call_count, 2)
+
+    def test_explicit_connection_skips_scan_and_prompts(self):
+        result, args, prompt, scan = self.select(
+            argv=["--interface", "enp9s0", "--slaves", "2,5"])
+        self.assertTrue(result)
+        self.assertEqual(args.interface, "enp9s0")
+        self.assertEqual(args.slaves, [2, 5])
+        prompt.assert_not_called()
+        scan.assert_not_called()
+
+    def test_only_missing_connection_parameter_is_prompted(self):
+        result, args, prompt, scan = self.select(
+            argv=["--interface", "enp9s0"], inputs=["2,5"])
+        self.assertTrue(result)
+        self.assertEqual(args.interface, "enp9s0")
+        self.assertEqual(args.slaves, [2, 5])
+        prompt.assert_called_once()
+        scan.assert_not_called()
+        result, args, prompt, scan = self.select(argv=["--slaves", "4,6"], inputs=["2"])
+        self.assertTrue(result)
+        self.assertEqual(args.interface, "enp2s0")
+        self.assertEqual(args.slaves, [4, 6])
+        prompt.assert_called_once()
+        scan.assert_called_once_with()
+
+    def run_without_backend(self, inputs=(), interfaces=("enp1s0", "enp2s0")):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(yiyou, "terminal_required"), \
+                mock.patch.object(yiyou, "available_interfaces", return_value=list(interfaces)), \
+                mock.patch("builtins.input", side_effect=inputs), \
+                mock.patch.object(yiyou, "BackendProcess", side_effect=AssertionError("backend started")) as backend, \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = yiyou.main(["jog", "--backend", sys.executable])
+        backend.assert_not_called()
+        return result
+
+    def test_no_physical_interface_is_rejected_without_starting_backend(self):
+        self.assertEqual(self.run_without_backend(interfaces=[]), 2)
+
+    def test_cancel_eof_and_interrupt_at_either_prompt_never_start_backend(self):
+        for inputs in [["q"], ["0"], [EOFError], [KeyboardInterrupt],
+                       ["1", "q"], ["1", EOFError], ["1", KeyboardInterrupt]]:
+            with self.subTest(inputs=inputs):
+                self.assertEqual(self.run_without_backend(inputs), 0)
+
+    def test_selected_connection_reaches_backend_only_after_both_prompts(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(yiyou, "terminal_required"), \
+                mock.patch.object(yiyou, "available_interfaces", return_value=["enp1s0", "enp2s0"]), \
+                mock.patch("builtins.input", side_effect=["2", "2,4"]), \
+                mock.patch.object(yiyou, "load_calibration"), \
+                mock.patch.object(yiyou, "BackendProcess") as backend, \
+                mock.patch.object(yiyou, "wait_ready", return_value={}), \
+                mock.patch.object(yiyou, "run_jog"), \
+                mock.patch.object(yiyou, "wait_backend_exit", return_value=0), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(yiyou.main(["jog", "--backend", sys.executable]), 0)
+        backend.assert_called_once()
+        args = backend.call_args.args[0]
+        self.assertEqual(args.interface, "enp2s0")
+        self.assertEqual(args.slaves, [2, 4])
+
+
+class YiyouPositionMemoryUiTests(unittest.TestCase):
+    def axis(self, **fields):
+        return yiyou.axis_from_json(dict(
+            slave=4, identity=[4247, 65537, 64, 65553], scale=36000,
+            position=120000, **fields))
+
+    def test_restored_logical_position_is_displayed(self):
+        axis = self.axis(raw_position=12000, position_valid=True)
+        self.assertEqual(axis.angle_deg, 1200)
+        state = yiyou.TerminalState("jog", "eth0", [4], {4: axis})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            yiyou.render(state)
+        self.assertIn("1200.000 deg", output.getvalue())
+
+    def test_invalid_record_is_visible_and_never_presented_as_output_angle(self):
+        axis = self.axis(position_valid=False, position_error="missing state")
+        state = yiyou.TerminalState("jog", "eth0", [4], {4: axis})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            yiyou.render(state)
+        self.assertIn("累计角度未知，已禁止移动", output.getvalue())
+        self.assertIn("missing state", output.getvalue())
+        self.assertNotIn("输出角=", output.getvalue())
+
+    def test_refusal_keeps_ui_available_for_explicit_zero(self):
+        state = yiyou.TerminalState("jog", "eth0", [4], {4: self.axis()}, busy="step")
+        backend = mock.Mock()
+        backend.poll_events.return_value = [{"event": "rejected", "message": "limit"}]
+        backend.process.poll.return_value = None
+        yiyou.handle_backend_events(mock.Mock(), state, backend)
+        self.assertIsNone(state.busy)
+        self.assertEqual(state.status, "limit")
+
+    def test_explicit_zero_restores_validity(self):
+        state = yiyou.TerminalState(
+            "jog", "eth0", [4], {4: self.axis(position_valid=False)}, busy="zero")
+        with mock.patch.object(yiyou, "persist_record") as persist:
+            yiyou.apply_done_event(mock.Mock(), state, {
+                "command": "zero", "slave": 4, "position": 0, "position_valid": True})
+        self.assertTrue(state.axes[4].position_valid)
+        self.assertEqual(state.axes[4].angle_deg, 0)
+        persist.assert_called_once()
+
+    def test_fourth_axis_home_is_rejected_before_motion(self):
+        with self.assertRaisesRegex(yiyou.UserError, "禁止自动回零"):
+            yiyou.verify_home_records(mock.Mock(slaves=[4]), {4: self.axis()}, {})
+
+
 class ToolResolutionTests(unittest.TestCase):
     def test_default_build_outputs_use_project_root(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
@@ -205,7 +395,7 @@ class ToolResolutionTests(unittest.TestCase):
             tools.mkdir(parents=True)
             config.mkdir(parents=True)
             shutil.copy(ROOT / "test/debug.py", tools / "debug.py")
-            shutil.copy(ROOT / "test/tools/yiyou_control.py", tools / "yiyou_control.py")
+            shutil.copy(ROOT / "tools/yiyou_control.py", tools / "yiyou_control.py")
             (config / "steering.yaml").write_text("{}")
             for mode in ["bxi", "yiyou", "chassis-remote"]:
                 result = subprocess.run([sys.executable, str(tools / "debug.py"), "--mode", mode,
@@ -218,7 +408,7 @@ class ToolResolutionTests(unittest.TestCase):
     def test_yiyou_backend_search_uses_new_build_and_installed_sibling(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source = root / "test/tools/yiyou_control.py"
+            source = root / "tools/yiyou_control.py"
             source.parent.mkdir(parents=True)
             source.touch()
             build = root / "external-build"
@@ -231,12 +421,6 @@ class ToolResolutionTests(unittest.TestCase):
                     mock.patch.dict(os.environ, {"CHASSIS_BUILD_DIR": str(build),
                                                  "CHASSIS_INSTALL_DIR": str(install)}):
                 self.assertEqual(yiyou.find_backend(), backend)
-            default_backend = root / "build/chassis/arm_yiyou_control"
-            default_backend.parent.mkdir(parents=True)
-            shutil.copy(backend, default_backend)
-            with mock.patch.object(yiyou, "__file__", str(source)), \
-                    mock.patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(yiyou.find_backend(), default_backend)
             installed = install / "chassis/lib/chassis"
             installed.mkdir(parents=True)
             shutil.copy(backend, installed / "arm_yiyou_control")
@@ -343,6 +527,16 @@ class NativeDiagnosticTests(unittest.TestCase):
                 result = subprocess.run([str(executable), *argv], text=True,
                                         capture_output=True, timeout=3)
                 self.assertEqual(result.returncode, expected, result.stderr)
+
+    def test_fourth_axis_raw_motion_and_zero_are_rejected_before_hardware(self):
+        executable = self.executable("arm_yiyou_test")
+        for operation in [["--degrees", "1"], ["--pulses", "1"], ["--zero-cycle"]]:
+            with self.subTest(operation=operation):
+                result = subprocess.run(
+                    [str(executable), "--interface", "eth0", "--slave", "4", *operation],
+                    text=True, capture_output=True, timeout=3)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("shared position memory", result.stderr)
 
     def test_arm_solver_computes_and_rejects_invalid_console_input(self):
         executable = self.executable("arm_solver")

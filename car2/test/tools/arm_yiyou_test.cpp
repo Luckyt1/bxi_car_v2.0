@@ -89,6 +89,7 @@ void usage()
     "  --timeout SEC         Motion timeout (default: 30, maximum: 3600)\n"
     "  --position-tolerance-pulses N  Allowed final position error (default: 100)\n"
     "  --info-only           Read information without enabling the motor\n"
+    "Slave 4 motion/zero tests are refused; use start_yiyou_jog.sh with its shared position memory.\n"
     "Run exclusively: this test controls the shared motor power through BXI CAN power only.\n"
     "--zero-cycle overwrites the motor zero and saves all current saveable parameters.\n"
     "Normal completion, errors and Ctrl+C stop the motor and switch power off.\n"
@@ -170,6 +171,10 @@ Options parse(int argc, char ** argv)
     options.timeout_s <= 0 || options.timeout_s > 3600)
   {
     throw std::invalid_argument("speed/acceleration must be positive; timeout must be in (0, 3600]");
+  }
+  if (options.slave == 4 && !options.info_only) {
+    throw std::invalid_argument(
+            "slave 4 motion and zero require shared position memory; use start_yiyou_jog.sh --slaves 4");
   }
   chassis::ethercat::validate_selection({options.interface, {options.slave}});
   return options;

@@ -1,9 +1,14 @@
 #include "chassis/control.h"
 #include "arm/control.h"
+#include "arm/torque_log.h"
 #include "example/arm_parameters.h"
-#include "example/arm_current_remote.h"
+#include "example/arm_position_remote.h"
+#include "example/arm_visual_tracking.h"
+#include "example/app_interface.h"
+#include "example/app_arm_control.h"
 #include "example/velocity_command_watchdog.hpp"
 #include "bxi/board.h"
+#include "motor/iswv/diagnostic_log.h"
 #include "example/remote_control.h"
 #include "geometry_msgs/msg/twist.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -14,19 +19,35 @@
 #include <vector>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <cerrno>
+#include <cstring>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char ** environ;
 
 // ROS 2 底盘节点：负责参数、速度消息和定时调度，硬件控制由 ChassisController 完成。
 namespace
 {
 std::filesystem::path default_config_directory()
 {
+  if (const char * configured = std::getenv("CHASSIS_CONFIG_DIR"); configured && *configured) {
+    const std::filesystem::path directory(configured);
+    if (!directory.is_absolute() || !std::filesystem::is_directory(directory)) {
+      throw std::invalid_argument("CHASSIS_CONFIG_DIR must be an existing absolute directory");
+    }
+    return directory;
+  }
   // 开发时直接读取源码配置；独立部署时使用可执行程序所在安装目录的配置。
   const std::filesystem::path source(CHASSIS_SOURCE_CONFIG_DIR);
   if (std::filesystem::is_directory(source)) {return source;}
@@ -34,13 +55,51 @@ std::filesystem::path default_config_directory()
   return executable.parent_path().parent_path().parent_path() / "share/chassis/config";
 }
 
+// Runs only before opening hardware or after every hardware owner was destroyed.
+// A separate process keeps plotting dependencies outside the control process.
+void generate_torque_reports(const std::string & directory) noexcept
+{
+  if (directory.empty()) {return;}
+  try {
+    if (!std::filesystem::is_directory(directory)) {return;}
+    std::filesystem::path script(CHASSIS_TORQUE_REPORT_SCRIPT);
+    if (!std::filesystem::is_regular_file(script)) {
+      script = std::filesystem::canonical("/proc/self/exe").parent_path() /
+        "arm_torque_report.py";
+    }
+    if (!std::filesystem::is_regular_file(script)) {
+      std::cerr << "Arm torque report script unavailable; CSV retained in " << directory << '\n';
+      return;
+    }
+    std::array<std::string, 8> arguments{
+      "/usr/bin/python3", "-I", "-S", script.string(), "--directory", directory, "--keep", "3"};
+    std::array<char *, 9> argv{};
+    for (std::size_t i = 0; i < arguments.size(); ++i) {argv[i] = arguments[i].data();}
+    pid_t child{};
+    const int error = ::posix_spawn(&child, argv[0], nullptr, nullptr, argv.data(), environ);
+    if (error != 0) {
+      std::cerr << "Arm torque report launch failed: " << std::strerror(error) << '\n';
+      return;
+    }
+    int status{};
+    pid_t waited;
+    do {waited = ::waitpid(child, &status, 0);} while (waited < 0 && errno == EINTR);
+    if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      std::cerr << "Arm torque report generation incomplete; CSV retained in " << directory << '\n';
+    }
+  } catch (const std::exception & error) {
+    std::cerr << "Arm torque report unavailable: " << error.what() << '\n';
+  }
+}
+
 class ChassisNode final : public rclcpp::Node
 {
 public:
   explicit ChassisNode(
     bool enable_arm, const rclcpp::NodeOptions & options,
-    std::function<void()> poll_remote = {})
-  : Node("chassis", options)
+    std::function<void()> poll_remote = {},
+    std::shared_ptr<chassis::ArmTorqueLog> torque_log = {})
+  : Node("chassis", options), torque_log_(std::move(torque_log))
   {
     const auto startup = read_startup_config(enable_arm);
     initialize_hardware(startup, enable_arm, poll_remote);
@@ -58,10 +117,14 @@ private:
     chassis::ethercat::Options ethercat_options;
     chassis::ArmMotionConfig arm_motion;
     std::array<std::uint16_t, 3> ethercat_positions;
+    std::optional<std::uint16_t> fourth_position;
   };
 
   StartupConfig read_startup_config(bool enable_arm)
   {
+    rcl_interfaces::msg::ParameterDescriptor app_descriptor;
+    app_descriptor.read_only = true;
+    app_interface_enabled_ = declare_parameter<bool>("app_interface_enabled", false, app_descriptor);
     rcl_interfaces::msg::ParameterDescriptor timeout_descriptor;
     timeout_descriptor.read_only = true;
     timeout_descriptor.description = "Stop chassis after this many seconds without cmd_vel_car";
@@ -87,6 +150,7 @@ private:
     chassis::ethercat::Options ethercat_options;
     chassis::ArmMotionConfig arm_motion;
     std::array<std::uint16_t, 3> ethercat_positions{};
+    std::optional<std::uint16_t> fourth_position;
     if (enable_arm) {
       rcl_interfaces::msg::ParameterDescriptor topology_descriptor;
       topology_descriptor.read_only = true;
@@ -98,7 +162,7 @@ private:
         std::set<std::int64_t>(positions.begin(), positions.end()).size() != positions.size())
       {
         throw std::invalid_argument(
-                "set three or four unique yiyou_ethercat_slaves; fourth entry uses CST");
+                "set three or four unique yiyou_ethercat_slaves; fourth entry uses PP jog");
       }
       for (std::size_t i = 0; i < positions.size(); ++i) {
         if (positions[i] < 1 || positions[i] > 199) {
@@ -107,11 +171,15 @@ private:
         ethercat_options.slaves.push_back(static_cast<std::uint16_t>(positions[i]));
         if (i < 3) {ethercat_positions[i] = static_cast<std::uint16_t>(positions[i]);}
       }
-      if (positions.size() == 4) {ethercat_options.cst_slave = ethercat_options.slaves[3];}
+      if (positions.size() == 4) {fourth_position = ethercat_options.slaves[3];}
       chassis::ethercat::validate_selection(ethercat_options);
-      chassis::declare_arm_current_parameter(*this, ethercat_options.cst_slave.has_value());
+      chassis::declare_legacy_arm_current_parameter(*this);
       arm_motion = chassis::declare_arm_motion_parameters(*this);
+      arm_motion.ethercat_interface = ethercat_options.interface;
+      ethercat_options.monitor_torque = bool(torque_log_);
+      arm_motion.monitor_torque = bool(torque_log_);
       chassis::declare_arm_pose_parameter(*this);
+      chassis::declare_arm_tracking_parameter(*this);
       rcl_interfaces::msg::ParameterDescriptor limit_descriptor;
       limit_descriptor.read_only = true;
       limit_descriptor.description =
@@ -129,7 +197,7 @@ private:
     }
     return {
       std::move(config), forward_rpm, std::move(ethercat_options),
-      std::move(arm_motion), ethercat_positions};
+      std::move(arm_motion), ethercat_positions, fourth_position};
   }
 
   // 启动顺序：底盘上电 -> 机械臂初始化/回零 -> 底盘校准。
@@ -156,7 +224,7 @@ private:
     if (poll_remote) {poll_remote();}
     if (!rclcpp::ok()) {throw std::runtime_error("startup cancelled");}
     if (enable_arm) {
-      // 前三轴 PP，列表第四项 CST；共享电源已由底盘开启。
+      // 四轴均使用 PP，第四轴独立位置点动；共享电源已由底盘开启。
       auto master = std::make_shared<chassis::ethercat::Master>(startup.ethercat_options);
       // BXI remains the shared power switch; no Yiyou CAN frames are sent.
       auto power = std::make_shared<chassis::BxiPciTransport>(3);
@@ -164,7 +232,12 @@ private:
         master, startup.ethercat_positions, [power] {
           const auto result = power->set_motor_power(false);
           if (!result) {throw std::runtime_error(result.error().message);}
-        }, startup.ethercat_options.cst_slave, startup.arm_motion);
+        }, startup.fourth_position, startup.arm_motion);
+      if (torque_log_) {
+        arm_->set_torque_observer([log = torque_log_](const chassis::ArmTorqueSample & sample) {
+          log->record(sample);
+        });
+      }
       arm_->initialize();
       if (!rclcpp::ok()) {throw std::runtime_error("startup cancelled");}
       arm_->update();
@@ -172,11 +245,11 @@ private:
         get_logger(),
         "EtherCAT: Yiyou axes 1-3 initially hold startup positions in PP mode; "
         "no zero saving or EEPROM writes");
-      if (arm_->has_current_axis()) {
+      if (arm_->has_fourth_axis()) {
         RCLCPP_INFO(
-          get_logger(), "EtherCAT: Yiyou axis 4 uses CST at slave %u; "
-          "yiyou_motor_4_current_permille=0 at startup, runtime range [-1000,1000]",
-          static_cast<unsigned>(*startup.ethercat_options.cst_slave));
+          get_logger(), "EtherCAT: Yiyou axis 4 uses PP at slave %u; speed=%.3f RPM; "
+          "software limits [0,1200] degrees; release holds; timeout 300 ms",
+          static_cast<unsigned>(*startup.fourth_position), startup.arm_motion.fourth_speed_rpm);
       }
       RCLCPP_INFO(
         get_logger(), "EtherCAT protection: abs(speed) >= 60 RPM cuts shared motor power; "
@@ -235,12 +308,10 @@ private:
   {
     // 末端目标在校准完成后开放；旧单轴调角参数仍为只读。
     if (arm_) {
-      arm_current_remote_ = std::make_unique<chassis::ArmCurrentRemote>(
-        *this, arm_->has_current_axis());
-      arm_pose_callback_ = add_on_set_parameters_callback(
-        [this](const std::vector<rclcpp::Parameter> & parameters) {
-          return chassis::validate_arm_pose_parameters(*arm_, parameters);
-        });
+      arm_position_remote_ = std::make_unique<chassis::ArmPositionRemote>(
+        *this, *arm_);
+      arm_visual_tracking_ = std::make_unique<chassis::ArmVisualTracking>(
+        *this, *arm_, [this](const std::exception & error) {on_fault(error);});
       arm_pose_publisher_ = create_publisher<geometry_msgs::msg::PoseStamped>("/arm_pose", 10);
       RCLCPP_INFO(
         get_logger(),
@@ -254,10 +325,35 @@ private:
       "/cmd_vel_car", rclcpp::QoS(rclcpp::KeepLast(1)),
       [this](geometry_msgs::msg::Twist::ConstSharedPtr message) {
         try {
-          controller_->set_velocity(message->linear.x, message->linear.y, message->angular.z);
           command_watchdog_->record_command(chassis::VelocityCommandWatchdog::Clock::now());
+          if (!arm_visual_tracking_ || arm_visual_tracking_->accept_manual_chassis_command(
+              message->linear.x, message->linear.y, message->angular.z))
+          {
+            controller_->set_velocity(message->linear.x, message->linear.y, message->angular.z);
+            visual_owned_chassis_ = false;
+          } else {
+            // Neutral joystick heartbeats must not overwrite visual lateral motion.
+            // A manual intervention latches tracking off before this value is read.
+            controller_->set_velocity(0.0, arm_visual_tracking_->lateral_velocity(), 0.0);
+          }
         } catch (const std::exception & error) {on_fault(error);}
       });
+    if (app_interface_enabled_) {
+      if (arm_) {
+        app_arm_control_ = std::make_unique<chassis::AppArmControl>(
+          *this, *arm_, *arm_visual_tracking_,
+          [this](chassis::AppArmControl::Clock::time_point now) {
+            return command_watchdog_->has_fresh_command(now);
+          });
+      }
+      app_interface_ = std::make_unique<chassis::AppInterface>(
+        *this, bool(arm_), arm_ && arm_->has_fourth_axis(),
+        [this](int command) {
+          try {
+            if (app_arm_control_) {app_arm_control_->command(command);}
+          } catch (const std::exception & error) {on_fault(error);}
+        });
+    }
     timer_ = create_wall_timer(std::chrono::milliseconds(20), [this] {update_control();});
   }
 
@@ -270,17 +366,33 @@ private:
           get_logger(),
           "/cmd_vel_car silent for %.3f s; forcing zero chassis velocity",
           command_timeout_);
+        if (arm_visual_tracking_ && arm_visual_tracking_->owns_chassis()) {
+          arm_visual_tracking_->cancel_tracking("chassis command heartbeat expired");
+        }
         controller_->stop();
+        if (app_arm_control_) {app_arm_control_->stop();}
       }
       if (arm_) {
-        arm_->update();
-        arm_current_remote_->update();
-        chassis::apply_arm_current_parameter(*this, *arm_);
-        try {
-          chassis::apply_arm_pose_parameter(*this, *arm_, last_arm_pose_request_);
-        } catch (const std::invalid_argument & error) {
-          RCLCPP_WARN(get_logger(), "Arm target rejected before motion: %s", error.what());
+        if (app_arm_control_) {app_arm_control_->before_update();}
+        arm_position_remote_->update();
+        arm_visual_tracking_->before_update();
+        // Timeout logging is one-shot; the motion gate must remain closed until
+        // a new heartbeat arrives, including after an explicit tracking re-enable.
+        if (arm_visual_tracking_->owns_chassis() &&
+          !command_watchdog_->has_fresh_command(chassis::VelocityCommandWatchdog::Clock::now()))
+        {
+          arm_visual_tracking_->cancel_tracking("no fresh chassis command heartbeat");
         }
+        arm_->update();
+        arm_visual_tracking_->after_update();
+        const bool visual_owns_chassis = arm_visual_tracking_->owns_chassis();
+        if (visual_owns_chassis) {
+          controller_->set_velocity(0.0, arm_visual_tracking_->lateral_velocity(), 0.0);
+        } else if (visual_owned_chassis_) {
+          // Do not retain the last visual velocity across the manual handover.
+          controller_->stop();
+        }
+        visual_owned_chassis_ = visual_owns_chassis;
         const auto pose = arm_->actual_pose();
         geometry_msgs::msg::PoseStamped feedback;
         feedback.header.stamp = get_clock()->now();
@@ -296,6 +408,7 @@ private:
       // 消费最近生成的一秒零速反馈报告；无新报告时为空，不额外读取 CAN。
       const auto report = controller_->take_stop_diagnostic();
       if (!report.empty()) {RCLCPP_INFO(get_logger(), "%s", report.c_str());}
+      if (app_interface_) {app_interface_->publish_ready();}
     } catch (const std::exception & error) {on_fault(error);}
   }
 
@@ -324,17 +437,21 @@ private:
   }
 
   // 保存对象所有权，使控制器、订阅和定时器在节点运行期间持续有效。
+  std::shared_ptr<chassis::ArmTorqueLog> torque_log_;
   std::unique_ptr<chassis::ChassisController> controller_;
   // 声明在 controller_ 后，正常退出时先停止意优电机，再由底盘断电。
   std::unique_ptr<chassis::ArmController> arm_;
-  std::unique_ptr<chassis::ArmCurrentRemote> arm_current_remote_;
-  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr arm_pose_callback_;
+  std::unique_ptr<chassis::ArmPositionRemote> arm_position_remote_;
+  std::unique_ptr<chassis::ArmVisualTracking> arm_visual_tracking_;
+  std::unique_ptr<chassis::AppArmControl> app_arm_control_;
+  std::unique_ptr<chassis::AppInterface> app_interface_;
+  bool app_interface_enabled_{false};
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr arm_pose_publisher_;
-  std::vector<double> last_arm_pose_request_;
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr subscription_;
   rclcpp::TimerBase::SharedPtr timer_;
   std::unique_ptr<chassis::VelocityCommandWatchdog> command_watchdog_;
   double command_timeout_{0.3};
+  bool visual_owned_chassis_{false};
   bool failed_{false};
 };
 
@@ -356,22 +473,24 @@ void print_help(const char * program_name, const std::string & mode, bool enable
     std::cout <<
       "yiyou_ethercat.yaml loads automatically; --params-file and -p override its values.\n"
       "Set yiyou_ethercat_interface:=enpXsY; yiyou_ethercat_slaves defaults to [1,2,3,4].\n"
-      "First three entries hold startup positions in PP; fourth entry uses CST.\n"
+      "First three entries hold startup positions in PP; fourth entry uses PP jog.\n"
       "Three entries retain PP-only operation; entries are physical slave positions.\n"
-      "yiyou_motor_4_current_permille starts at 0; runtime signed integer [-1000,1000].\n"
+      "Fourth PP speed: yiyou_motor_4_speed_rpm (12 RPM); limits [0,1200] degrees.\n"
       "Runtime arm target: yiyou_arm_target=[x_m,z_m,pitch_rad]; feedback: /arm_pose.\n"
       "Remote buttons 1/3 select x/z/pitch; axis7 steps by 1 cm or 1 degree.\n"
       "Holding axis7 repeats every 0.1 s; neutral stops repeats; busy steps are discarded.\n"
-      "Hold button0/4 for fourth-axis +/-5% rated current; release or both buttons clears it.\n"
-      "Release both current buttons before use; remote current expires after 300 ms.\n"
+      "Hold button0/4 for fourth-axis positive/negative position jog; release/both holds.\n"
+      "Release both jog buttons before use; /arm_motor4_jog expires after 300 ms.\n"
       "Joint zero matches simulation [+150,-150,0] geometric offsets.\n"
       "yiyou_arm_home_on_start defaults true: return to saved zero before chassis calibration.\n"
       "Set yiyou_arm_home_on_start:=false to hold startup positions instead.\n"
-      "PP speed defaults 0.6 output RPM; acceleration/deceleration 1.0 RPM/s.\n"
-      "Legacy joint jog is disabled; CST zero current does not hold position.\n";
+      "Axes 1-3 PP speed defaults 0.6 RPM; acceleration/deceleration 1.0 RPM/s.\n"
+      "Axis 4 PP acceleration/deceleration defaults 24 RPM/s; old current commands disabled.\n";
   } else {
     std::cout << "Chassis only: CAN0/1/2; no CAN3 initialization or arm motor commands.\n";
   }
+  std::cout << "App gateway: app_interface_enabled:=true publishes /car2/ready and "
+    "/car2/state_machine_info; CHASSIS_CONFIG_DIR selects persistent configuration.\n";
   std::cout << "Help does not open CAN devices or command motors.\n";
 }
 
@@ -396,7 +515,9 @@ rclcpp::NodeOptions initialize_ros(int argc, char ** argv, bool enable_arm)
 }
 
 // 统一管理遥控等待、节点启动和执行器，返回前释放节点及硬件。
-int run_control(bool enable_arm, bool enable_remote, const rclcpp::NodeOptions & options)
+int run_control(
+  bool enable_arm, bool enable_remote, const rclcpp::NodeOptions & options,
+  const std::shared_ptr<chassis::ArmTorqueLog> & torque_log)
 {
   std::shared_ptr<ChassisNode> chassis_node;
   std::shared_ptr<rclcpp::Node> remote_node;
@@ -417,7 +538,7 @@ int run_control(bool enable_arm, bool enable_remote, const rclcpp::NodeOptions &
       // 启动请求由遥控回调提出；在回调外初始化，校准时才能继续 spin 遥控器。
       session->stage = chassis::RemoteControlSession::Stage::starting;
       chassis_node = std::make_shared<ChassisNode>(
-        enable_arm, options, [&executor] {executor.spin_some();});
+        enable_arm, options, [&executor] {executor.spin_some();}, torque_log);
       executor.add_node(chassis_node);
       session->stage = chassis::RemoteControlSession::Stage::running;
     }
@@ -440,14 +561,39 @@ int main(int argc, char ** argv)
   }
 
   int result = 0;
+  std::string torque_directory;
+  std::shared_ptr<chassis::ArmTorqueLog> torque_log;
+  if (enable_arm) {
+    const auto configured = std::getenv("CHASSIS_ARM_TORQUE_LOG_DIR");
+    torque_directory = configured ? configured : "log/arm_torque";
+    generate_torque_reports(torque_directory);
+    if (!torque_directory.empty()) {
+      try {
+        torque_log = std::make_shared<chassis::ArmTorqueLog>(torque_directory);
+      } catch (const std::exception & error) {
+        std::cerr << "Arm torque logging unavailable: " << error.what() << '\n';
+      }
+    }
+  }
+  // Keep retention running while the operator is waiting to press start, too.
+  std::unique_ptr<iswv::canopen::DiagnosticLog> can_log_retention;
+  try {
+    const auto directory = std::getenv("CHASSIS_CAN_LOG_DIR");
+    can_log_retention = std::make_unique<iswv::canopen::DiagnosticLog>(
+      directory ? directory : "log/can", "retention");
+  } catch (const std::exception & error) {
+    std::cerr << "CAN log retention unavailable: " << error.what() << '\n';
+  }
   try {
     const auto options = initialize_ros(argc, argv, enable_arm);
-    result = run_control(enable_arm, enable_remote, options);
+    result = run_control(enable_arm, enable_remote, options, torque_log);
   } catch (const std::exception & error) {
     RCLCPP_FATAL(rclcpp::get_logger("control"), "%s", error.what());
     result = 1;
   }
   // run_control 返回或抛出时已析构节点：先停机械臂，再由底盘关闭共享电源。
   rclcpp::shutdown();
+  if (torque_log) {torque_log->finish();}
+  generate_torque_reports(torque_directory);
   return result;
 }

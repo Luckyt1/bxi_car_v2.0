@@ -9,6 +9,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace iswv::canopen
@@ -28,6 +29,8 @@ struct MasterOptions
   std::size_t event_queue_limit{4096};
   std::size_t sdo_queue_limit_per_node{256};
   std::chrono::milliseconds timer_resolution{2};
+  // Empty disables diagnostics. Fault captures are retained for seven days.
+  std::string diagnostic_log_directory;
 };
 
 // One CANopen session per shared transport; node IDs are 1..127.

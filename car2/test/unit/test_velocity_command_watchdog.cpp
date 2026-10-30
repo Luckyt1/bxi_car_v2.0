@@ -20,6 +20,8 @@ void no_initial_message_never_times_out()
   const auto start = Clock::time_point{};
   require(!watchdog.consume_timeout(start), "no command must not time out immediately");
   require(!watchdog.consume_timeout(start + 10s), "no command must keep the chassis stopped");
+  require(!watchdog.has_fresh_command(start + 10s),
+    "visual control must remain inhibited before the first chassis heartbeat");
 }
 
 void boundary_triggers_at_timeout()
@@ -27,8 +29,10 @@ void boundary_triggers_at_timeout()
   chassis::VelocityCommandWatchdog watchdog(300ms);
   const auto start = Clock::time_point{};
   watchdog.record_command(start);
+  require(watchdog.has_fresh_command(start + 299ms), "fresh command must permit visual control");
   require(!watchdog.consume_timeout(start + 299ms), "299 ms must remain inside the timeout");
   require(watchdog.consume_timeout(start + 300ms), "300 ms must trigger timeout");
+  require(!watchdog.has_fresh_command(start + 300ms), "freshness expires at the timeout boundary");
   require(!watchdog.consume_timeout(start + 301ms), "timeout must report only once");
 }
 
@@ -51,6 +55,10 @@ void command_stream_loss_times_out_once()
   require(!watchdog.consume_timeout(start + 250ms), "active command must be held before timeout");
   require(watchdog.consume_timeout(start + 300ms), "lost command stream must time out");
   require(!watchdog.consume_timeout(start + 1s), "lost command stream must not spam timeout");
+  require(!watchdog.has_fresh_command(start + 1s),
+    "consumed timeout must not permit a newly enabled visual session without a heartbeat");
+  require(!watchdog.has_fresh_command(start + 1h),
+    "absence must stay inhibited after any number of mode changes");
 }
 
 void new_command_recovers_after_timeout()
@@ -60,6 +68,8 @@ void new_command_recovers_after_timeout()
   watchdog.record_command(start);
   require(watchdog.consume_timeout(start + 300ms), "initial stream must time out");
   watchdog.record_command(start + 350ms);
+  require(watchdog.has_fresh_command(start + 350ms), "a new heartbeat restores freshness");
+  require(!watchdog.has_fresh_command(start + 349ms), "future receipts cannot authorize motion");
   require(!watchdog.consume_timeout(start + 600ms), "new command must refresh the deadline");
   require(watchdog.consume_timeout(start + 650ms), "refreshed stream must time out later");
 }

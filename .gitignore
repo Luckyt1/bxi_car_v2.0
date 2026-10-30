@@ -4,6 +4,14 @@ build-*/
 install/
 log/
 logs/
+Log/
+state/
+.backups/
+.ci/
+dist/
+.venv-vision/
+yiyou_zero_calibration.json
+yiyou_ethercat_zero_calibration.json
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake

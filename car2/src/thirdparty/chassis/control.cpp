@@ -1,16 +1,17 @@
 #include "chassis/control.h"
 #include "bxi/board.h"
 #include "motor/iswv/motor.h"
-#include "motor/iswv/bxi_transport.h"
 #include "chassis/swerve_kinematics.hpp"
 #include "chassis/steering_target_limits.hpp"
 #include "chassis/steering_tuning.hpp"
 #include "chassis/torque_limit_detector.hpp"
+#include "chassis/calibration_feedback.hpp"
 #include "iswv/iswv/object_dictionary.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <thread>
@@ -90,17 +91,10 @@ public:
     }
     wheel_diameter_m_ = 2.0 * modules_[0].wheel_radius_m;
     if (!hardware_.open) {
-      hardware_.open = [](unsigned int bus) {
-          return std::make_shared<iswv::BxiTransport>(std::make_shared<BxiPciTransport>(bus));
-        };
+      hardware_.open = [](unsigned int bus) {return std::make_shared<BxiPciTransport>(bus);};
       hardware_.power = [this](bool enabled) {
-          const auto adapter = std::dynamic_pointer_cast<iswv::BxiTransport>(transports_[0]);
-          if (!adapter) {return;}
-          const auto board = std::dynamic_pointer_cast<BxiPciTransport>(adapter->transport());
-          if (board) {
-            const auto result = board->set_motor_power(enabled);
-            if (!result) {throw std::runtime_error("motor power: " + result.error().message);}
-          }
+          const auto transport = std::dynamic_pointer_cast<BxiPciTransport>(transports_[0]);
+          if (transport) {require_success(transport->set_motor_power(enabled), "motor power");}
         };
     }
   }
@@ -119,7 +113,10 @@ public:
         if (!transports_[bus] || !transports_[bus]->is_open()) {
           throw std::runtime_error("cannot open CAN" + std::to_string(bus));
         }
-        masters_[bus] = std::make_unique<iswv::canopen::CanopenMaster>(transports_[bus]);
+        iswv::canopen::MasterOptions options;
+        const auto log_directory = std::getenv("CHASSIS_CAN_LOG_DIR");
+        options.diagnostic_log_directory = log_directory ? log_directory : "log/can";
+        masters_[bus] = std::make_unique<iswv::canopen::CanopenMaster>(transports_[bus], options);
       }
       // Construct every axis before power-on, so partial failures can stop all of them.
       steering_ = std::make_unique<SteeringAxes>(*masters_[0], config_);
@@ -744,6 +741,8 @@ namespace
 constexpr std::array<const char *, 4> kWheelNames{
   "front_left", "rear_left", "rear_right", "front_right"};
 constexpr std::array<std::size_t, 4> kAllAxes{{0, 1, 2, 3}};
+constexpr double kCalibrationAccelerationRps2 = 1.0;
+constexpr double kCalibrationDecelerationRps2 = 4.0;
 
 double position_to_rad(
   const SwerveModuleConfig & module, std::int32_t position,
@@ -784,6 +783,7 @@ public:
     validate_chassis_config(config_);
     for (std::size_t index = 0; index < axes_.size(); ++index) {
       axes_[index] = steering.at(static_cast<iswv::WheelPosition>(index));
+      feedback_[index] = std::make_unique<CalibrationFeedback>(axes_[index]->node());
       search_motor_rpm_[index] = calibration_motor_search_rpm(config_, index);
     }
   }
@@ -800,11 +800,13 @@ public:
     std::cout << "将用输出轴速度 " << config_.calibration_search_speed_rpm
               << " rpm 同时校准 CAN0 四个转向轴；"
               << "各轴负限位立即反向，正限位后独立回中，不在限位等待其他轴。"
-              << "故障、通信失败、超速或输出力矩超限均中止。\n";
+              << "故障、通信失败、超速或输出力矩超限均中止。\n"
+              << "校准反馈使用 TPDO1/2/3；每帧最大年龄 100 ms，位置/电流时间差不超过 20 ms。\n";
 
     for (const auto index : kAllAxes) {
       configure_axis(index);
     }
+    feedback_not_before_ = std::chrono::steady_clock::now();
     auto result = calibrate_all_axes();
     success_ = true;
     return result;
@@ -843,7 +845,6 @@ private:
     auto result = axis->node()->send_nmt(
       iswv::canopen::NmtCommand::enter_pre_operational);
     require_success(result, std::string(kWheelNames[index]) + " NMT pre-operational failed");
-    axis_ready_[index] = true;
     result = axis->drive().transition_to(iswv::cia402::DriveState::switch_on_disabled);
     require_success(result, std::string(kWheelNames[index]) + " 退出使能失败");
     result = axis->command_torque_percent(0.0);
@@ -854,8 +855,8 @@ private:
     result = axis->configure_default_pdos(config_.motor.pdo);
     require_success(result, std::string(kWheelNames[index]) + " 配置 PDO 失败");
     result = axis->configure_velocity_mode(
-      false, std::min(config_.motor.acceleration_rps2, 1.0),
-      std::min(config_.motor.deceleration_rps2, 1.0));
+      false, std::min(config_.motor.acceleration_rps2, kCalibrationAccelerationRps2),
+      std::min(config_.motor.deceleration_rps2, kCalibrationDecelerationRps2));
     require_success(result, std::string(kWheelNames[index]) + " 配置速度模式失败");
     require_mode(axis, iswv::cia402::OperationMode::profile_velocity);
 
@@ -923,34 +924,21 @@ private:
   }
 
   iswv::cia402::DriveState require_healthy(
-    const std::shared_ptr<iswv::Axis> & axis, std::size_t index, bool allow_disabled = false)
+    const CalibrationSample & sample, std::size_t index, bool allow_disabled = false)
   {
-    const auto status = axis->drive().read_status();
-    const auto error1 = axis->node()->read(iswv::objects::error_status);
-    const auto error2 = axis->node()->read(iswv::objects::error_status_2);
-    if (!status || !error1 || !error2) {
-      std::ostringstream message;
-      message << kWheelNames[index] << " (Node-ID "
-              << static_cast<unsigned>(config_.motor.node_ids[index])
-              << ") 无法读取驱动器保护状态，停止校准";
-      if (!status) {message << "; status(0x6041): " << status.error().message;}
-      if (!error1) {message << "; error_status(0x2601): " << error1.error().message;}
-      if (!error2) {message << "; error_status_2(0x2602): " << error2.error().message;}
-      throw std::runtime_error(message.str());
-    }
-    const auto state = iswv::cia402::decode_state(status.value());
+    const auto state = iswv::cia402::decode_state(sample.status_word);
     const bool allowed_disabled = allow_disabled &&
       (state == iswv::cia402::DriveState::switch_on_disabled ||
       state == iswv::cia402::DriveState::ready_to_switch_on ||
       state == iswv::cia402::DriveState::switched_on);
     if ((!allowed_disabled && state != iswv::cia402::DriveState::operation_enabled) ||
-      error1.value() != 0 || error2.value() != 0)
+      sample.error_status != 0 || sample.error_status_2 != 0)
     {
       std::ostringstream message;
       message << kWheelNames[index] << " 驱动器非正常使能或存在故障，停止校准: status=0x"
-              << std::hex << status.value() << ", error1=0x" << error1.value()
-              << ", error2=0x" << error2.value() << std::dec;
-      if ((error1.value() & 0x0800U) != 0U) {
+              << std::hex << sample.status_word << ", error1=0x" << sample.error_status
+              << ", error2=0x" << sample.error_status_2 << std::dec;
+      if ((sample.error_status & 0x0800U) != 0U) {
         message << "；检测到电机/驱动器过载，疑似硬限位卡滞、机械阻力过大或持续顶住限位";
       }
       throw std::runtime_error(message.str());
@@ -958,12 +946,46 @@ private:
     return state;
   }
 
-  void require_ready_axes_healthy()
+  std::string feedback_error(std::size_t index, const std::string & reason) const
   {
-    for (const auto index : kAllAxes) {
-      if (axis_ready_[index]) {
-        require_healthy(axes_[index], index);
+    return std::string(kWheelNames[index]) + " (Node-ID " +
+           std::to_string(config_.motor.node_ids[index]) +
+           ") 校准反馈无效，停止校准: " + reason;
+  }
+
+  CalibrationSample read_feedback(std::size_t index) const
+  {
+    const auto sample = feedback_[index]->snapshot(feedback_not_before_);
+    if (!sample) {throw std::runtime_error(feedback_error(index, sample.error().message));}
+    return sample.value();
+  }
+
+  std::array<CalibrationSample, 4> wait_for_initial_feedback()
+  {
+    // Targets are still zero. Require all three PDOs received after each axis
+    // was mapped and enabled; configuration-era frames cannot authorize motion.
+    const auto deadline = std::chrono::steady_clock::now() + 250ms;
+    std::array<CalibrationSample, 4> samples;
+    while (true) {
+      require_running(keep_running_);
+      bool ready = true;
+      std::string missing;
+      for (const auto index : kAllAxes) {
+        const auto sample = feedback_[index]->snapshot(feedback_not_before_);
+        if (!sample) {
+          missing = feedback_error(index, sample.error().message);
+          if (sample.error().code != iswv::ErrorCode::timeout) {
+            throw std::runtime_error(missing);
+          }
+          ready = false;
+          continue;
+        }
+        require_healthy(sample.value(), index);
+        samples[index] = sample.value();
       }
+      if (ready) {return samples;}
+      if (std::chrono::steady_clock::now() >= deadline) {throw std::runtime_error(missing);}
+      std::this_thread::sleep_for(5ms);
     }
   }
 
@@ -975,31 +997,34 @@ private:
     const TorqueLimitDetector detector(
       config_.calibration_contact_torque_nm, config_.calibration_torque_limit_nm);
     // A PV reversal must decelerate through zero before moving away. Allow its
-    // configured ramp plus a bounded settling margin, never the full search wait.
-    const double ramp_rps2 = std::min(
-        {
-          config_.motor.acceleration_rps2, config_.motor.deceleration_rps2, 1.0});
+    // separate deceleration/acceleration ramps plus a bounded settling margin.
+    const double acceleration_rps2 = std::min(
+      config_.motor.acceleration_rps2, kCalibrationAccelerationRps2);
+    const double deceleration_rps2 = std::min(
+      config_.motor.deceleration_rps2, kCalibrationDecelerationRps2);
     std::array<double, 4> release_timeout_s{};
     for (const auto index : kAllAxes) {
       release_timeout_s[index] = std::min(
         config_.calibration_timeout_s,
-        std::max(1.0, 2.0 * search_motor_rpm_[index] / (60.0 * ramp_rps2) + 0.5));
+        std::max(
+          1.0, search_motor_rpm_[index] / 60.0 *
+          (1.0 / deceleration_rps2 + 1.0 / acceleration_rps2) + 0.5));
     }
     const auto release_distance_inc = std::max(1, config_.calibration_position_epsilon_inc);
 
+    const auto initial = wait_for_initial_feedback();
     for (const auto index : kAllAxes) {
-      const auto initial = axes_[index]->node()->read(iswv::objects::actual_position);
-      require_success(initial, std::string(kWheelNames[index]) + " 无法读取起始位置");
-      progress[index].previous_position = initial.value();
+      (void)detector.update(
+        output_torque_nm(config_, modules_[index], initial[index].current_raw), false);
+      progress[index].previous_position = initial[index].position_raw;
+      progress[index].previous_time = initial[index].position_received_at;
     }
-    require_ready_axes_healthy();
     for (const auto index : kAllAxes) {
       require_running(keep_running_);
       require_success(
         axes_[index]->command_velocity_pdo(-search_motor_rpm_[index]),
         std::string(kWheelNames[index]) + " 发送负向校准速度失败");
       progress[index].started = std::chrono::steady_clock::now();
-      progress[index].previous_time = progress[index].started;
     }
 
     auto last_print = std::chrono::steady_clock::now();
@@ -1011,33 +1036,32 @@ private:
       for (const auto index : kAllAxes) {
         require_running(keep_running_);
         auto & state = progress[index];
+        const auto sample = read_feedback(index);
         const auto drive_state = require_healthy(
-          axes_[index], index, state.phase == Phase::preparing_midpoint);
-        const auto position = axes_[index]->node()->read(iswv::objects::actual_position);
-        const auto current = axes_[index]->node()->read(iswv::objects::actual_current);
-        require_success(position, std::string(kWheelNames[index]) + " 读取校准位置失败");
-        require_success(current, std::string(kWheelNames[index]) + " 读取校准电流失败");
+          sample, index, state.phase == Phase::preparing_midpoint);
+        const auto position = sample.position_raw;
+        const auto current = sample.current_raw;
         const auto now = std::chrono::steady_clock::now();
-        const double torque_nm = output_torque_nm(config_, modules_[index], current.value());
+        const double torque_nm = output_torque_nm(config_, modules_[index], current);
         // Includes release, return and already-centered axes: residual contact
         // may defer limit detection, but must never bypass the safety ceiling.
         (void)detector.update(torque_nm, false);
         const double elapsed_s = std::chrono::duration<double>(now - state.started).count();
         if (print_feedback) {
           std::cout << "反馈 " << kWheelNames[index] << "：阶段=" << phase_name(state.phase)
-                    << "；位置=" << position.value() << " inc；实际电流=" << current.value()
+                    << "；位置=" << position << " inc；实际电流=" << current
                     << " raw；估算输出力矩=" << torque_nm << " N·m（未计减速效率）\n";
         }
 
         if (state.phase == Phase::midpoint) {
           const auto error_inc = std::abs(
-            static_cast<std::int64_t>(position.value()) - result.midpoints[index]);
+            static_cast<std::int64_t>(position) - result.midpoints[index]);
           const bool centered = error_inc <= config_.calibration_position_epsilon_inc;
           all_centered = all_centered && centered;
           if (centered && !state.midpoint_reported) {
             state.midpoint_reported = true;
             std::cout << kWheelNames[index] << " 中位已到达：目标=" << result.midpoints[index]
-                      << " inc，实际=" << position.value() << " inc，保持并等待其他轴完成\n";
+                      << " inc，实际=" << position << " inc，保持并等待其他轴完成\n";
           }
           if (!centered && elapsed_s >= config_.calibration_timeout_s) {
             throw std::runtime_error(std::string(kWheelNames[index]) + " 移动到实时中位超时");
@@ -1050,11 +1074,14 @@ private:
           if (elapsed_s >= std::min(2.0, config_.calibration_timeout_s)) {
             throw std::runtime_error(std::string(kWheelNames[index]) + " 切换回中模式超时");
           }
-          prepare_midpoint(index, state, drive_state, position.value(), result.midpoints[index]);
+          prepare_midpoint(index, state, drive_state, position, result.midpoints[index]);
           continue;
         }
-        const double seconds = std::chrono::duration<double>(now - state.previous_time).count();
-        const auto delta = static_cast<std::int64_t>(position.value()) - state.previous_position;
+        // PDO samples have their own receive times; polling the same sample
+        // twice must not distort the encoder-derived overspeed check.
+        const double seconds = std::chrono::duration<double>(
+          sample.position_received_at - state.previous_time).count();
+        const auto delta = static_cast<std::int64_t>(position) - state.previous_position;
         if (seconds > 0.0) {
           const double rpm = std::abs(static_cast<double>(delta)) * 60.0 /
             (modules_[index].steering_encoder_resolution * seconds);
@@ -1065,8 +1092,10 @@ private:
                     std::to_string(config_.calibration_speed_rpm) + "，停止校准");
           }
         }
-        state.previous_time = now;
-        state.previous_position = position.value();
+        if (seconds > 0.0) {
+          state.previous_time = sample.position_received_at;
+          state.previous_position = position;
+        }
         const double timeout_s = state.phase == Phase::releasing_negative ?
           release_timeout_s[index] : config_.calibration_timeout_s;
         if (elapsed_s >= timeout_s) {
@@ -1077,7 +1106,7 @@ private:
 
         const bool contact = torque_nm >= config_.calibration_contact_torque_nm;
         if (state.phase == Phase::releasing_negative) {
-          const auto moved = static_cast<std::int64_t>(position.value()) -
+          const auto moved = static_cast<std::int64_t>(position) -
             result.negative_limits[index];
           if (moved >= release_distance_inc && !contact) {
             state.phase = Phase::positive;
@@ -1085,7 +1114,7 @@ private:
             std::cout << kWheelNames[index] << " 已离开负限位，开始检测正限位\n";
           }
         } else if (state.phase == Phase::negative && contact) {
-          result.negative_limits[index] = position.value();
+          result.negative_limits[index] = position;
           // Send the opposite target in this iteration, before servicing another
           // axis. PV acceleration/deceleration remains active in the drive.
           require_running(keep_running_);
@@ -1094,11 +1123,11 @@ private:
             std::string(kWheelNames[index]) + " 负限位反向指令失败");
           state.phase = Phase::releasing_negative;
           state.started = std::chrono::steady_clock::now();
-          std::cout << kWheelNames[index] << " 负向限位已检测：位置=" << position.value()
+          std::cout << kWheelNames[index] << " 负向限位已检测：位置=" << position
                     << " inc，估算输出力矩=" << torque_nm << " N·m，已下发反向速度\n";
           continue;
         } else if (state.phase == Phase::positive && contact) {
-          const auto separation_inc = static_cast<std::int64_t>(position.value()) -
+          const auto separation_inc = static_cast<std::int64_t>(position) -
             result.negative_limits[index];
           const double separation_rad = static_cast<double>(separation_inc) * 2.0 * kPi /
             (static_cast<double>(modules_[index].steering_encoder_resolution) *
@@ -1111,7 +1140,7 @@ private:
                     std::to_string(config_.calibration_min_limit_separation_rad) +
                     " rad；疑似机械卡滞、硬限位位置异常或编码器方向/计数异常，停止校准");
           }
-          result.positive_limits[index] = position.value();
+          result.positive_limits[index] = position;
           start_midpoint(index, result);
           state.phase = Phase::preparing_midpoint;
           state.started = std::chrono::steady_clock::now();
@@ -1129,8 +1158,8 @@ private:
         return result;
       }
       if (print_feedback) {last_print = loop_start;}
-      // Four axes share one CAN bus. Include SDO time; no barrier at either limit
-      // or midpoint. This is a scheduling target, not hardware synchronization.
+      // Four axes share one CAN bus. Telemetry uses timestamped PDOs; mode
+      // changes may still use SDO. This period is a scheduling target only.
       std::this_thread::sleep_until(loop_start + search_period);
     }
   }
@@ -1227,7 +1256,6 @@ private:
     (void)axes_[index]->command_motor_velocity_rpm(0.0);
     (void)axes_[index]->drive().quick_stop();
     (void)axes_[index]->drive().disable();
-    axis_ready_[index] = false;
   }
 
   void stop_all() noexcept
@@ -1242,7 +1270,8 @@ private:
   std::array<SwerveModuleConfig, 4> modules_{};
   std::array<double, 4> search_motor_rpm_{};
   std::array<std::shared_ptr<iswv::Axis>, 4> axes_{};
-  std::array<bool, 4> axis_ready_{};
+  std::array<std::unique_ptr<CalibrationFeedback>, 4> feedback_{};
+  std::chrono::steady_clock::time_point feedback_not_before_{};
   bool success_{false};
 };
 

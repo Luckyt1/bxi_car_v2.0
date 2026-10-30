@@ -1,0 +1,12 @@
+{
+  "calibrated": true,
+  "camera_mount": "tool",
+  "rotation": [[0, 0, 1], [-1, 0, 0], [0, -1, 0]],
+  "translation_m": [0, 0, 0.0625],
+  "offset_below_m": 0.0745,
+  "approach_standoff_m": 0.04,
+  "min_valid_frames": 3,
+  "max_frame_age_s": 0.25,
+  "max_pose_age_s": 0.25,
+  "max_target_jump_m": 0.05
+}

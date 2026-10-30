@@ -1,0 +1,19 @@
+[Unit]
+Description=Arm tracking camera (headless, wait for joystick button6)
+After=network.target ros_elf_launch.service
+
+[Service]
+Type=simple
+User=bxi
+WorkingDirectory=/opt/bxi_car/car2
+ExecStart=/bin/bash /opt/bxi_car/car2/start_arm_tracking.sh --headless --joystick --tracking-mode approach --print-hz 0.2
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=car2-arm-tracking
+
+[Install]
+WantedBy=multi-user.target

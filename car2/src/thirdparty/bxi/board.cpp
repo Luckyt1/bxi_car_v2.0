@@ -1,6 +1,6 @@
 #include "bxi/board.h"
 
-#include "bxi/can_frame.h"
+#include "iswv/can_frame.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +19,7 @@ std::size_t BxiPciTransport::transport_count_{0};
 
 namespace
 {
-void trace_frame(const char * direction, unsigned int bus, const bxi::CanFrame & frame)
+void trace_frame(const char * direction, unsigned int bus, const iswv::CanFrame & frame)
 {
   static std::mutex output_mutex;
   std::ostringstream line;
@@ -77,15 +77,15 @@ BxiPciTransport::~BxiPciTransport()
   }
 }
 
-bxi::Result<void> BxiPciTransport::send(const bxi::CanFrame & frame)
+iswv::Result<void> BxiPciTransport::send(const iswv::CanFrame & frame)
 {
   if (!open_.load()) {
-    return bxi::Result<void>::failure(
-      bxi::ErrorCode::transport_closed, "BXI PCI CAN interface is closed");
+    return iswv::Result<void>::failure(
+      iswv::ErrorCode::transport_closed, "BXI PCI CAN interface is closed");
   }
   auto packet = packet_from_frame(bus_, frame);
   if (!packet) {
-    return bxi::Result<void>::failure(packet.error());
+    return iswv::Result<void>::failure(packet.error());
   }
   auto value = packet.take_value();
   if (trace_) {trace_frame("TX-attempt", bus_, frame);}
@@ -95,19 +95,19 @@ bxi::Result<void> BxiPciTransport::send(const bxi::CanFrame & frame)
   static std::mutex enqueue_mutex;
   std::lock_guard<std::mutex> lock(enqueue_mutex);
   if (canfd_send_packet(&value, 1) < 0) {
-    return bxi::Result<void>::failure(
-      bxi::ErrorCode::transport_error, "BXI PCI CAN send failed");
+    return iswv::Result<void>::failure(
+      iswv::ErrorCode::transport_error, "BXI PCI CAN send failed");
   }
-  return bxi::Result<void>::success();
+  return iswv::Result<void>::success();
 }
 
-void BxiPciTransport::set_receive_handler(bxi::ReceiveHandler handler)
+void BxiPciTransport::set_receive_handler(iswv::ReceiveHandler handler)
 {
   std::lock_guard<std::mutex> lock(handler_mutex_);
   receive_handler_ = std::move(handler);
 }
 
-void BxiPciTransport::set_error_handler(bxi::TransportErrorHandler handler)
+void BxiPciTransport::set_error_handler(iswv::TransportErrorHandler handler)
 {
   std::lock_guard<std::mutex> lock(handler_mutex_);
   error_handler_ = std::move(handler);
@@ -123,25 +123,25 @@ std::string BxiPciTransport::name() const
   return "bxi-pci:bus" + std::to_string(bus_);
 }
 
-bxi::Result<void> BxiPciTransport::set_motor_power(bool enabled)
+iswv::Result<void> BxiPciTransport::set_motor_power(bool enabled)
 {
   if (!open_.load()) {
-    return bxi::Result<void>::failure(
-      bxi::ErrorCode::transport_closed, "BXI PCI CAN interface is closed");
+    return iswv::Result<void>::failure(
+      iswv::ErrorCode::transport_closed, "BXI PCI CAN interface is closed");
   }
   if (motor_pwr_set(enabled ? 1U : 0U) < 0) {
-    return bxi::Result<void>::failure(
-      bxi::ErrorCode::transport_error, "failed to switch motor power");
+    return iswv::Result<void>::failure(
+      iswv::ErrorCode::transport_error, "failed to switch motor power");
   }
-  return bxi::Result<void>::success();
+  return iswv::Result<void>::success();
 }
 
-bxi::Result<canfd_packet> BxiPciTransport::packet_from_frame(
-  unsigned int bus, const bxi::CanFrame & frame)
+iswv::Result<canfd_packet> BxiPciTransport::packet_from_frame(
+  unsigned int bus, const iswv::CanFrame & frame)
 {
-  if (!bxi::valid_frame(frame)) {
-    return bxi::Result<canfd_packet>::failure(
-      bxi::ErrorCode::invalid_argument, "invalid CAN frame");
+  if (!iswv::valid_frame(frame)) {
+    return iswv::Result<canfd_packet>::failure(
+      iswv::ErrorCode::invalid_argument, "invalid CAN frame");
   }
 
   canfd_packet packet{};
@@ -167,13 +167,13 @@ bxi::Result<canfd_packet> BxiPciTransport::packet_from_frame(
   }
   packet.frame.len = frame.size;
   std::copy_n(frame.data.begin(), frame.size, packet.frame.data);
-  return bxi::Result<canfd_packet>::success(packet);
+  return iswv::Result<canfd_packet>::success(packet);
 }
 
-bxi::Result<bxi::CanFrame> BxiPciTransport::frame_from_packet(
+iswv::Result<iswv::CanFrame> BxiPciTransport::frame_from_packet(
   const canfd_packet & packet)
 {
-  bxi::CanFrame frame;
+  iswv::CanFrame frame;
   frame.error = (packet.frame.can_id & CAN_ERR_FLAG) != 0U;
   frame.extended = !frame.error && (packet.frame.can_id & CAN_EFF_FLAG) != 0U;
   frame.remote = (packet.frame.can_id & CAN_RTR_FLAG) != 0U;
@@ -185,12 +185,12 @@ bxi::Result<bxi::CanFrame> BxiPciTransport::frame_from_packet(
   frame.error_state_indicator = (packet.frame.flags & CANFD_ESI) != 0U;
   frame.size = packet.frame.len;
   frame.received_at = std::chrono::steady_clock::now();
-  if (!bxi::valid_frame(frame)) {
-    return bxi::Result<bxi::CanFrame>::failure(
-      bxi::ErrorCode::protocol_error, "BXI PCI delivered an invalid CAN frame");
+  if (!iswv::valid_frame(frame)) {
+    return iswv::Result<iswv::CanFrame>::failure(
+      iswv::ErrorCode::protocol_error, "BXI PCI delivered an invalid CAN frame");
   }
   std::copy_n(packet.frame.data, frame.size, frame.data.begin());
-  return bxi::Result<bxi::CanFrame>::success(frame);
+  return iswv::Result<iswv::CanFrame>::success(frame);
 }
 
 int BxiPciTransport::receive_callback(void * context, canfd_packet * packet)
@@ -219,7 +219,7 @@ void BxiPciTransport::receive(const canfd_packet & packet)
   }
   if (trace_) {trace_frame("RX", bus_, frame.value());}
 
-  bxi::ReceiveHandler handler;
+  iswv::ReceiveHandler handler;
   {
     std::lock_guard<std::mutex> lock(handler_mutex_);
     handler = receive_handler_;
@@ -229,9 +229,9 @@ void BxiPciTransport::receive(const canfd_packet & packet)
   }
 }
 
-void BxiPciTransport::report_error(bxi::Error error)
+void BxiPciTransport::report_error(iswv::Error error)
 {
-  bxi::TransportErrorHandler handler;
+  iswv::TransportErrorHandler handler;
   {
     std::lock_guard<std::mutex> lock(handler_mutex_);
     handler = error_handler_;

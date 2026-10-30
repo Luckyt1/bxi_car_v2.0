@@ -1,0 +1,27 @@
+# Build and runtime output
+/build/
+/install/
+/log/
+/Log/
+/logs/
+/state/
+/yiyou*_zero_calibration.json
+/yiyou*_zero_calibration.json.*
+
+# Local development and backups
+/.backups/
+/.venv-vision/
+/.omx/
+/.vscode/
+/.idea/
+/.clangd
+/compile_commands.json
+__pycache__/
+*.py[cod]
+*.swp
+*.swo
+*~
+.env
+.env.*
+
+# Keep the required vendor archive src/thirdparty/bxi/vendor/lib/libbxi_pci_drv.a.

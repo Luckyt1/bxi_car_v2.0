@@ -32,6 +32,9 @@ public:
   void set_current_permille(std::int16_t permille);
   void check_current_mode();
   std::int16_t actual_current_permille();
+  std::optional<std::int16_t> actual_torque_permille() const;
+  std::optional<std::uint32_t> rated_torque_millinewton_meter() const;
+  std::optional<double> actual_torque_newton_meter() const;
   // 绝对位置 pulse；等待 set-point acknowledge 握手，不等待运动完成。
   void move_to_position(std::int32_t position);
   // Runtime PP handshake, advanced by the owner without sleep/poll loops.
@@ -40,6 +43,11 @@ public:
   bool stage_position_command();
   void trigger_position_command();
   bool finish_position_command();
+  // PP 减速并保持使能；取消未完成握手。下一目标确认并触发前保持 halt。
+  // 不等待机械停止；停止失败由调用方执行故障下电。
+  void halt_position();
+  // Runtime health check without stop/wait side effects; owner handles fault power-off first.
+  void check_position_mode();
   // 最近一次握手成功的目标：bit10 置位且实际位置误差在主机容差内；无目标时返回 false。
   bool position_reached(std::uint32_t tolerance_pulses = 100);
   bool motion_stopped();
@@ -64,8 +72,6 @@ public:
 
 private:
   void select_ethercat_control();
-  void disable_for_configuration();
-  void wait_for_mode_display(const char * operation);
   void enable_mode(
     iswv::cia402::OperationMode mode, std::uint32_t velocity,
     std::uint32_t acceleration, std::uint32_t deceleration);
@@ -78,6 +84,7 @@ private:
   std::optional<std::int32_t> position_target_;
   enum class PositionCommand {idle, clearing, staged, triggered, resetting};
   PositionCommand position_command_{PositionCommand::idle};
+  bool position_halted_{false};
   std::int32_t pending_position_{0};
   iswv::cia402::OperationMode mode_{iswv::cia402::OperationMode::profile_velocity};
   double pulses_per_output_revolution_{0};

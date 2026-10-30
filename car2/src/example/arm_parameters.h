@@ -40,6 +40,15 @@ inline ArmMotionConfig declare_arm_motion_parameters(rclcpp::Node & node)
     "yiyou_arm_speed_rpm", config.speed_rpm, descriptor);
   config.acceleration_rpm_s = node.declare_parameter<double>(
     "yiyou_arm_acceleration_rpm_s", 1.0, descriptor);
+  config.fourth_speed_rpm = node.declare_parameter<double>(
+    "yiyou_motor_4_speed_rpm", config.fourth_speed_rpm, descriptor);
+  config.fourth_acceleration_rpm_s = node.declare_parameter<double>(
+    "yiyou_motor_4_acceleration_rpm_s", config.fourth_acceleration_rpm_s, descriptor);
+  config.fourth_position_memory_file = node.declare_parameter<std::string>(
+    "yiyou_motor_4_position_memory_file", PositionMemory::default_path(), descriptor);
+  if (config.fourth_position_memory_file.empty()) {
+    throw std::invalid_argument("yiyou_motor_4_position_memory_file must not be empty");
+  }
   config.home_on_start = node.declare_parameter<bool>(
     "yiyou_arm_home_on_start", true, descriptor);
   validate_arm_motion_config(config);
@@ -93,28 +102,14 @@ inline void apply_arm_pose_parameter(
   arm.set_target_pose({values[0], values[1], values[2]});
 }
 
-inline void declare_arm_current_parameter(rclcpp::Node & node, bool has_current_axis)
+// Explicitly reject old current commands: PP jog must use the leased topic.
+inline void declare_legacy_arm_current_parameter(rclcpp::Node & node)
 {
   rcl_interfaces::msg::ParameterDescriptor descriptor;
-  descriptor.description =
-    "Fourth arm axis CST target, signed rated-current permille; startup must be zero";
-  descriptor.read_only = !has_current_axis;
-  rcl_interfaces::msg::IntegerRange range;
-  range.from_value = -1000;
-  range.to_value = 1000;
-  range.step = 1;
-  descriptor.integer_range.push_back(range);
+  descriptor.read_only = true;
+  descriptor.description = "Removed CST command; fixed zero in fourth-axis PP mode";
   if (node.declare_parameter<std::int64_t>(kYiyouCurrentParameter, 0, descriptor) != 0) {
-    throw std::invalid_argument("yiyou_motor_4_current_permille must be zero at startup");
+    throw std::invalid_argument("yiyou_motor_4_current_permille is disabled in PP mode");
   }
-}
-
-// Read only committed ROS values in the serial control timer. Rejected atomic
-// parameter batches cannot change hardware through a validation callback.
-inline void apply_arm_current_parameter(rclcpp::Node & node, ArmController & arm)
-{
-  if (!arm.has_current_axis()) {return;}
-  const auto current = node.get_parameter(kYiyouCurrentParameter).as_int();
-  if (current != arm.target_current_permille()) {arm.set_current_permille(current);}
 }
 }  // namespace chassis

@@ -1,7 +1,6 @@
 #include "bxi/board.h"
 #include "motor/bxi/motor.h"
 #include "motor/iswv/motor.h"
-#include "motor/iswv/bxi_transport.h"
 
 #include <chrono>
 #include <cmath>
@@ -22,7 +21,7 @@ namespace
 using namespace std::chrono_literals;
 volatile std::sig_atomic_t stopped = 0;
 void request_stop(int) {stopped = 1;}
-void require(bxi::Result<void> result)
+void require(iswv::Result<void> result)
 {
   if (!result) {throw std::runtime_error(result.error().message);}
 }
@@ -163,7 +162,7 @@ int main(int argc, char ** argv)
         bxi_motor = std::make_unique<bxi::Motor>(*transport, options.node);
         transport->set_receive_handler(
           [feedback, id = options.node | 0x10U,
-          ranges = bxi::encoding_ranges(options.model)](const bxi::CanFrame & frame) {
+          ranges = bxi::encoding_ranges(options.model)](const iswv::CanFrame & frame) {
             if (frame.id != id) {return;}
             const auto value = bxi::decode_feedback(frame, ranges);
             if (value) {
@@ -172,8 +171,7 @@ int main(int argc, char ** argv)
             }
           });
       } else {
-        master = std::make_unique<iswv::canopen::CanopenMaster>(
-          std::make_shared<iswv::BxiTransport>(transport));
+        master = std::make_unique<iswv::canopen::CanopenMaster>(transport);
         iswv_motor = std::make_unique<chassis::IswvDrive>(
           *master,
           iswv::AxisConfiguration::manual_travel(static_cast<std::uint8_t>(options.node)));

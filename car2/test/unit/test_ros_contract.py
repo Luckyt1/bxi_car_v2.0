@@ -13,13 +13,14 @@ class RosContract(unittest.TestCase):
     bin_dir = Path()
     config = Path()
 
-    def run_entry(self, name, *arguments):
+    def run_entry(self, name, *arguments, environment_overrides=None):
         if name == "chassis" and arguments != ("--help",):
             # Stop before hardware even if an arm parameter override regresses.
             arguments += ("--", "--ros-args", "-p", "can3_motor_1_angle_deg:=1.0")
         with tempfile.TemporaryDirectory(prefix="chassis-ros-contract-") as log_dir:
             environment = os.environ.copy()
             environment.update(ROS_LOCALHOST_ONLY="1", ROS_LOG_DIR=log_dir)
+            environment.update(environment_overrides or {})
             return subprocess.run(
                 [str(self.bin_dir / name), *arguments],
                 env=environment,
@@ -72,6 +73,23 @@ class RosContract(unittest.TestCase):
                     "post_calibration_rpm must be in [0, drive_max_output_rpm]",
                 )
 
+    def test_persistent_config_directory_overrides_existing_source_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_entry(
+                "chassis_only", "--ros-args", "-p", "post_calibration_rpm:=-1.0",
+                environment_overrides={"CHASSIS_CONFIG_DIR": directory},
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(str(Path(directory) / "steering.yaml"), result.stdout)
+
+    def test_invalid_persistent_config_directory_fails_before_hardware(self):
+        result = self.run_entry(
+            "chassis_only", "--ros-args", "-p", "post_calibration_rpm:=-1.0",
+            environment_overrides={"CHASSIS_CONFIG_DIR": "relative/config"},
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("CHASSIS_CONFIG_DIR must be an existing absolute directory", result.stdout)
+
     def test_invalid_command_timeout_is_rejected_before_hardware(self):
         for value in ("0.0", "-0.1", ".nan", ".inf"):
             with self.subTest(value=value):
@@ -79,6 +97,15 @@ class RosContract(unittest.TestCase):
                     "chassis_only", [f"command_timeout_sec:={value}"],
                     "command_timeout_sec must be positive and finite",
                 )
+
+    def test_fourth_position_parameters_reject_before_hardware(self):
+        for parameter in ("yiyou_motor_4_speed_rpm:=0.0", "yiyou_motor_4_speed_rpm:=60.0",
+                          "yiyou_motor_4_speed_rpm:=.nan", "yiyou_motor_4_acceleration_rpm_s:=-1.0"):
+            with self.subTest(parameter=parameter):
+                self.reject_startup("chassis", [parameter],
+                                    "invalid fourth-axis profile speed/acceleration")
+        self.reject_startup("chassis", ["yiyou_motor_4_current_permille:=500"],
+                            "yiyou_motor_4_current_permille is disabled in PP mode")
 
     def test_default_arm_config_is_loaded_before_motion_validation(self):
         self.reject_startup(

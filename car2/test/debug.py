@@ -29,7 +29,7 @@ def resolve_tool(name, script=False, dry_run=False):
     if root is None:
         candidates = [here / name]
     elif script:
-        candidates = [root / "test" / "tools" / name]
+        candidates = [root / "tools" / name, root / "test" / "tools" / name]
     else:
         build = Path(os.environ.get("CHASSIS_BUILD_DIR", root / "build"))
         install = Path(os.environ.get("CHASSIS_INSTALL_DIR", root / "install"))

@@ -66,9 +66,9 @@ EncodingRanges encoding_ranges(Model model)
   throw std::invalid_argument("unknown BXI motor model");
 }
 
-bxi::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
+iswv::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
 {
-  using Result = bxi::Result<std::array<std::uint8_t, 8>>;
+  using Result = iswv::Result<std::array<std::uint8_t, 8>>;
   const auto & ranges = command.ranges;
   if (!in_range(command.position, ranges.position) ||
     !in_range(command.velocity, ranges.velocity) ||
@@ -77,7 +77,7 @@ bxi::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
     !in_range(command.torque, ranges.torque))
   {
     return Result::failure(
-      bxi::ErrorCode::invalid_argument,
+      iswv::ErrorCode::invalid_argument,
       "BXI MIT command requires finite ordered encoding ranges and finite values within them");
   }
   const auto p = encode(command.position, ranges.position, 16);
@@ -98,42 +98,42 @@ bxi::Result<std::array<std::uint8_t, 8>> pack_command(const Command & command)
     (payload[7] >= 0xfa && payload[7] <= 0xfe))
   {
     return Result::failure(
-      bxi::ErrorCode::invalid_argument,
+      iswv::ErrorCode::invalid_argument,
       "BXI MIT command collides with a special control frame (0xFA..0xFE)");
   }
   return Result::success(payload);
 }
 
-bxi::Result<Feedback> decode_feedback(const bxi::CanFrame & frame, const EncodingRanges & ranges)
+iswv::Result<Feedback> decode_feedback(const iswv::CanFrame & frame, const EncodingRanges & ranges)
 {
-  if (!bxi::valid_frame(frame) || frame.extended || frame.remote || frame.error ||
+  if (!iswv::valid_frame(frame) || frame.extended || frame.remote || frame.error ||
     frame.size < 5)
   {
-    return bxi::Result<Feedback>::failure(
-      bxi::ErrorCode::protocol_error,
+    return iswv::Result<Feedback>::failure(
+      iswv::ErrorCode::protocol_error,
       "BXI feedback requires a valid standard data frame of at least five bytes");
   }
   if (!valid_range(ranges.position) || !valid_range(ranges.velocity)) {
-    return bxi::Result<Feedback>::failure(
-      bxi::ErrorCode::invalid_argument,
+    return iswv::Result<Feedback>::failure(
+      iswv::ErrorCode::invalid_argument,
       "BXI feedback requires finite ordered position and velocity encoding ranges");
   }
   const auto p = (static_cast<std::uint32_t>(frame.data[1]) << 8) | frame.data[2];
   const auto v = (static_cast<std::uint32_t>(frame.data[3]) << 4) | (frame.data[4] >> 4);
-  return bxi::Result<Feedback>::success(
+  return iswv::Result<Feedback>::success(
     Feedback{frame.data[0], decode(p, ranges.position, 16), decode(v, ranges.velocity, 12)});
 }
 
-bxi::Result<void> send_payload(
-  bxi::ICanTransport & transport, std::uint32_t command_id, FrameOptions options,
+iswv::Result<void> send_payload(
+  iswv::ICanTransport & transport, std::uint32_t command_id, FrameOptions options,
   const std::array<std::uint8_t, 8> & payload)
 {
   if (command_id > 0x7ffU || (!options.fd && options.bitrate_switch)) {
-    return bxi::Result<void>::failure(
-      bxi::ErrorCode::invalid_argument,
+    return iswv::Result<void>::failure(
+      iswv::ErrorCode::invalid_argument,
       "BXI motor requires a standard CAN ID and valid frame options");
   }
-  bxi::CanFrame frame{};
+  iswv::CanFrame frame{};
   frame.id = command_id;
   frame.size = 8;
   frame.fd = options.fd;

@@ -13,7 +13,8 @@ usage() {
   sudo -E bash start.sh robot [ROS 参数]         # 底盘 + 机械臂，等待手柄启动
   bash start.sh robot --dry-run                 # 只预览命令
 
-意优：默认网口 enp86s0、站位 1,2,3；可用 --interface / --slaves 覆盖。
+意优：启动时选择实体网口、输入要控制的站位（如 1,3）。
+      --interface / --slaves 可直接指定并跳过对应选择；输入 q 取消。
       左右选轴，上下点动，z 保存当前轴 EEPROM 零位，q 退出。
       启动工具本身不会设零；设零会保存该轴全部可持久化参数。
 底盘/整机：松开后按 button14 启动，button11 急停，Ctrl-C 退出。
@@ -23,8 +24,10 @@ usage() {
   CHASSIS_BUILD_DIR     构建目录，默认项目根目录下 build
   CHASSIS_INSTALL_DIR   安装目录，默认项目根目录下 install
   CHASSIS_CONFIG       底盘 YAML，默认 src/config/steering.yaml
+  CHASSIS_CAN_LOG_DIR  CAN 故障诊断目录，默认 log/can；仅保留最近 7 天
+  CHASSIS_ARM_TORQUE_LOG_DIR  机械臂力矩记录及图表，默认 log/arm_torque；仅保留 3 次
   YIYOU_CONFIG         整机机械臂 YAML，默认 src/config/yiyou_ethercat.yaml
-  YIYOU_INTERFACE / YIYOU_SLAVES  设零工具网口/站位的默认值
+  YIYOU_INTERFACE / YIYOU_SLAVES  设零选择界面的默认值（enp86s0 / 1,2,3）
   JOYSTICK_DEVICE      手柄设备，默认 /dev/input/js0
   JOYSTICK_START_BUTTON / JOYSTICK_ESTOP_BUTTON  启动/急停键，默认 14/11
 
@@ -67,26 +70,42 @@ if [[ -z "$mode" ]]; then
   done
 fi
 
-# 与调试菜单共用查找规则，默认使用项目根目录的 colcon 构建产物。
+# 查找本项目的 colcon/CMake 构建或安装产物。
 resolve_tool() {
   python3 -B - "$repo_root" "$1" "$dry_run" <<'PYTHON'
+import os
+from pathlib import Path
 import sys
-sys.path.insert(0, sys.argv[1] + "/test")
-import debug
-try:
-    print(debug.resolve_tool(sys.argv[2], dry_run=sys.argv[3] == "true"))
-except ValueError as error:
-    print(error, file=sys.stderr)
-    raise SystemExit(1)
+
+root, name, dry_run = Path(sys.argv[1]), sys.argv[2], sys.argv[3] == "true"
+build = Path(os.environ.get("CHASSIS_BUILD_DIR", root / "build"))
+install = Path(os.environ.get("CHASSIS_INSTALL_DIR", root / "install"))
+candidates = [build / "chassis" / name, build / name,
+              install / "chassis" / "lib" / "chassis" / name,
+              install / "lib" / "chassis" / name]
+for candidate in candidates:
+    if candidate.is_file():
+        print(candidate)
+        break
+else:
+    if dry_run:
+        print(candidates[0])
+    else:
+        print(f"找不到 {name}，请先构建；查找位置：" + ", ".join(map(str, candidates)),
+              file=sys.stderr)
+        raise SystemExit(1)
 PYTHON
 }
 
 if [[ "$mode" == zero ]]; then
   backend="$(resolve_tool arm_yiyou_control)"
-  command=(python3 "$repo_root/test/tools/yiyou_control.py" jog
-    --interface "${YIYOU_INTERFACE:-enp86s0}" --slaves "${YIYOU_SLAVES:-1,2,3}"
+  command=(python3 "$repo_root/tools/yiyou_control.py" jog
     --backend "$backend"
     --calibration-file "$repo_root/yiyou_ethercat_zero_calibration.json")
+  if [[ "$dry_run" == true ]]; then
+    command+=(--interface "${YIYOU_INTERFACE:-enp86s0}" --slaves "${YIYOU_SLAVES:-1,2,3}")
+    echo "命令预览使用默认网口/站位；实际启动时，未指定的参数将在终端选择。"
+  fi
   echo "意优设零：左右选轴，上下点动，按 z 保存当前轴零位，q 退出。"
 else
   binary=chassis_only_remote
@@ -125,6 +144,8 @@ if [[ "$dry_run" == true ]]; then
 fi
 
 if [[ "$mode" != zero ]]; then
+  export CHASSIS_CAN_LOG_DIR="${CHASSIS_CAN_LOG_DIR-$repo_root/log/can}"
+  export CHASSIS_ARM_TORQUE_LOG_DIR="${CHASSIS_ARM_TORQUE_LOG_DIR-$repo_root/log/arm_torque}"
   ros_setup="/opt/ros/${ROS_DISTRO:-humble}/setup.bash"
   if [[ ! -f "$ros_setup" ]]; then
     echo "找不到 ROS 环境：$ros_setup" >&2

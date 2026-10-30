@@ -3,11 +3,14 @@
 chassis:
   ros__parameters:
     yiyou_ethercat_interface: "enp86s0"
-    # 前三轴 PP，第四轴 CST 电流控制；第四轴上电零电流，不回零。
+    # 四轴 PP；第四轴保持实际启动位置，不自动回零或回到软件边界。
     yiyou_ethercat_slaves: [1, 2, 3, 4]
-    # 启动必须为 0；运行时为额定电流千分比 [-1000,1000]。
-    # 零电流不保持位置，也不提供重力支撑。
-    yiyou_motor_4_current_permille: 0
+    # 第四轴按住 button0/button4 正反点动，松手减速停止并保持。
+    # 输出轴 12 RPM = 72 度/秒；目标限制 0..1200 度，越界时仅允许向内返回。
+    yiyou_motor_4_speed_rpm: 12.0
+    yiyou_motor_4_acceleration_rpm_s: 24.0
+    # 第四轴多圈角度记录默认在工程 state/yiyou_motor4_position.yaml，调试工具共用。
+    # 可用非空绝对路径参数 yiyou_motor_4_position_memory_file 覆盖；断电期间轴必须不动。
     # 前三轴依次为肩、肘、腕；编码器 0 对应仿真 q=[0,0,0]。
     # 正关节角绕 -Y；按实机安装核对电机正方向，反向轴填 -1。
     yiyou_arm_motor_directions: [1, -1, 1]
@@ -21,3 +24,7 @@ chassis:
     # 设为 false 时保持启动位置。回零到位后才校准底盘并开放遥控。
     yiyou_arm_home_on_start: true
     # 运行后设置 yiyou_arm_target=[x米,z米,pitch弧度]。
+
+remote_ctrl:
+  ros__parameters:
+    arm_position_topic: "/arm_motor4_jog"

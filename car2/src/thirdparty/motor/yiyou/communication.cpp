@@ -1,4 +1,6 @@
 #include "motor/yiyou/communication.h"
+#include "motor/yiyou/cycle_timing.h"
+#include "motor/yiyou/cyclic_health.h"
 #include "iswv/cia402/drive.hpp"
 
 #include <ethercat.h>
@@ -32,13 +34,15 @@ using iswv::canopen::ObjectAddress;
 using iswv::canopen::SdoOptions;
 using iswv::canopen::SdoResponse;
 constexpr auto cycle_period = 2ms;
-constexpr auto feedback_deadline = 20ms;
+constexpr auto feedback_deadline = CyclicHealth::feedback_deadline;
+constexpr int receive_timeout_us = 1000;
 constexpr std::uint8_t process_group = 1;  // SOEM group 0 means ALL slaves.
 constexpr std::size_t profile_output_bytes = 11;
 constexpr std::size_t profile_input_bytes = 11;
 constexpr std::size_t cst_output_bytes = 5;
 constexpr std::size_t cst_input_bytes = 13;
-constexpr std::size_t max_process_bytes = cst_input_bytes;
+constexpr std::size_t torque_feedback_bytes = 2;
+constexpr std::size_t max_process_bytes = cst_input_bytes + torque_feedback_bytes;
 constexpr std::uint32_t yiyou_vendor_id = 0x00001097;  // ethercat.org registered vendor ID.
 std::mutex master_mutex;  // SOEM 1.4 legacy context: one master per process.
 
@@ -141,6 +145,19 @@ std::optional<Field> input_field(Layout layout, ObjectAddress object)
     default: return {};
   }
 }
+
+std::size_t input_bytes(Layout layout, bool torque_feedback_mapped)
+{
+  return input_bytes(layout) + (torque_feedback_mapped ? torque_feedback_bytes : 0);
+}
+
+std::optional<Field> input_field(Layout layout, bool torque_feedback_mapped, ObjectAddress object)
+{
+  if (object.subindex == 0 && object.index == 0x6077 && torque_feedback_mapped) {
+    return Field{input_bytes(layout), torque_feedback_bytes};
+  }
+  return input_field(layout, object);
+}
 }  // namespace
 
 struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
@@ -148,6 +165,8 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
   struct Image
   {
     Layout layout{Layout::profile};
+    bool torque_feedback_mapped{false};
+    std::optional<std::uint32_t> rated_torque_mnm{};
     std::array<std::uint8_t, max_process_bytes> output{};
     std::array<std::uint8_t, max_process_bytes> input{};
   };
@@ -175,6 +194,18 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
           iswv::ErrorCode::transport_closed, "EtherCAT master is closed");
       }
       return owner->write(position_, object, data, size, options);
+    }
+    std::optional<std::int16_t> cached_torque_permille() const override
+    {
+      auto owner = owner_.lock();
+      if (!owner) {return {};}
+      return owner->cached_torque_permille(position_);
+    }
+    std::optional<std::uint32_t> cached_rated_torque_millinewton_meter() const override
+    {
+      auto owner = owner_.lock();
+      if (!owner) {return {};}
+      return owner->cached_rated_torque_millinewton_meter(position_);
     }
     std::weak_ptr<Impl> owner_;
     std::uint16_t position_;
@@ -282,6 +313,18 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
     return value.value();
   }
   template<typename T>
+  std::optional<T> optional_startup_read(
+    std::uint16_t slave, std::uint16_t index, std::uint8_t sub = 0)
+  {
+    auto result = sdo_read(slave, {index, sub}, {});
+    if (!result) {return {};}
+    auto value = iswv::canopen::decode_little_endian<T>(
+      result.value().data.data(),
+      result.value().size);
+    if (!value) {return {};}
+    return value.value();
+  }
+  template<typename T>
   void startup_download(std::uint16_t slave, std::uint16_t index, std::uint8_t sub, T value)
   {
     const auto bytes = iswv::canopen::encode_little_endian(value);
@@ -304,6 +347,11 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
   void map_pdo(
     std::uint16_t slave, std::uint16_t index,
     std::initializer_list<std::uint32_t> entries)
+  {
+    map_pdo(slave, index, std::vector<std::uint32_t>(entries));
+  }
+  void map_pdo(
+    std::uint16_t slave, std::uint16_t index, const std::vector<std::uint32_t> & entries)
   {
     startup_download<std::uint8_t>(slave, index, 0, 0);
     std::uint8_t sub = 0;
@@ -433,6 +481,48 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
         (void)startup_read<std::int8_t>(slave, 0x6060);  // Confirm actual OD width, not PDF table typo.
         Image image;
         image.layout = layout_for(slave);
+        if (options_.monitor_torque) {
+          const auto torque = sdo_read(slave, {0x6077, 0}, {});
+          if (torque) {
+            const auto decoded = iswv::canopen::decode_little_endian<std::int16_t>(
+              torque.value().data.data(), torque.value().size);
+            if (decoded) {
+              image.torque_feedback_mapped = true;
+            } else {
+              std::cerr << "EtherCAT warning: optional torque feedback unavailable at slave "
+                        << slave << " object=0x6077:00: " << decoded.error().message << '\n';
+            }
+          } else {
+            std::cerr << "EtherCAT warning: optional torque feedback unavailable at slave "
+                      << slave << " object=0x6077:00: " << torque.error().message << '\n';
+          }
+          const auto rated = sdo_read(slave, {0x6076, 0}, {});
+          if (rated) {
+            const auto decoded = iswv::canopen::decode_little_endian<std::uint32_t>(
+              rated.value().data.data(), rated.value().size);
+            if (decoded && decoded.value() != 0) {
+              image.rated_torque_mnm = decoded.value();
+            } else {
+              const auto reason = decoded ?
+                std::string("rated torque is 0") : decoded.error().message;
+              std::cerr << "EtherCAT warning: optional rated torque unknown at slave " << slave
+                        << " object=0x6076:00: " << reason << '\n';
+            }
+          } else {
+            std::cerr << "EtherCAT warning: optional rated torque unknown at slave " << slave
+                      << " object=0x6076:00: " << rated.error().message << '\n';
+          }
+          if (image.torque_feedback_mapped) {
+            std::cerr << "EtherCAT slave=" << slave << " torque_feedback=available"
+                      << " rated_mnm=";
+            if (image.rated_torque_mnm) {
+              std::cerr << *image.rated_torque_mnm;
+            } else {
+              std::cerr << "unknown";
+            }
+            std::cerr << '\n';
+          }
+        }
         if (image.layout == Layout::cst) {
           (void)startup_read<std::int16_t>(slave, 0x6071);
           (void)startup_read<std::int16_t>(slave, 0x6078);
@@ -455,11 +545,16 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
         // Explicit widths and verified readback. Fail on incompatible firmware
         // rather than interpreting an unknown wire layout.
         if (images_.at(slave).layout == Layout::cst) {
+          std::vector<std::uint32_t> txpdo{0x60410010, 0x60640020, 0x60610008, 0x606C0020,
+            0x60780010};
+          if (images_.at(slave).torque_feedback_mapped) {txpdo.push_back(0x60770010);}
           map_pdo(slave, 0x1600, {0x60400010, 0x60710010, 0x60600008});
-          map_pdo(slave, 0x1A00, {0x60410010, 0x60640020, 0x60610008, 0x606C0020, 0x60780010});
+          map_pdo(slave, 0x1A00, txpdo);
         } else {
+          std::vector<std::uint32_t> txpdo{0x60410010, 0x60640020, 0x60610008, 0x606C0020};
+          if (images_.at(slave).torque_feedback_mapped) {txpdo.push_back(0x60770010);}
           map_pdo(slave, 0x1600, {0x60400010, 0x607A0020, 0x60600008, 0x60FF0020});
-          map_pdo(slave, 0x1A00, {0x60410010, 0x60640020, 0x60610008, 0x606C0020});
+          map_pdo(slave, 0x1A00, txpdo);
         }
         assign_pdo(slave, 0x1C12, {0x1600});
         assign_pdo(slave, 0x1C13, {0x1A00});
@@ -488,7 +583,8 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
       const int bytes = ec_config_map_group(io_map_.data(), process_group);
       std::size_t expected_bytes = 0;
       for (const auto & entry : images_) {
-        expected_bytes += output_bytes(entry.second.layout) + input_bytes(entry.second.layout);
+        expected_bytes += output_bytes(entry.second.layout) +
+          input_bytes(entry.second.layout, entry.second.torque_feedback_mapped);
       }
       if (bytes != static_cast<int>(expected_bytes)) {
         throw std::runtime_error("unexpected EtherCAT process image size");
@@ -496,7 +592,8 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
       for (auto & entry : images_) {
         const auto slave = entry.first;
         if (ec_slave[slave].Obytes != output_bytes(entry.second.layout) ||
-          ec_slave[slave].Ibytes != input_bytes(entry.second.layout) ||
+          ec_slave[slave].Ibytes != input_bytes(
+            entry.second.layout, entry.second.torque_feedback_mapped) ||
           ec_slave[slave].Ostartbit != 0 ||
           ec_slave[slave].Istartbit != 0)
         {
@@ -544,9 +641,20 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
       if (!operational) {throw std::runtime_error("EtherCAT OP transition/WKC failed");}
       for (auto & entry : images_) {
         std::copy_n(
-          ec_slave[entry.first].inputs, input_bytes(entry.second.layout),
+          ec_slave[entry.first].inputs,
+          input_bytes(entry.second.layout, entry.second.torque_feedback_mapped),
           entry.second.input.begin());
       }
+      std::cerr << "EtherCAT timing config: cycle_us=2000 receive_timeout_us="
+                << receive_timeout_us
+                << " al_timeout_us=1000 feedback_deadline_us=20000"
+                << " summary_interval_ms=5000 history_cycles=32 elapsed_clock=steady\n";
+      std::cerr << "EtherCAT protection config: pdo_consecutive_failures="
+                << CyclicHealth::pdo_failure_limit << " al_consecutive_timeouts_per_slave="
+                << CyclicHealth::al_failure_limit
+                << " al_retry=next_cycle feedback_deadline_ms=" << feedback_deadline.count()
+                << " non_op=immediate_fault invalid_pdo=discard\n";
+      timing_log_ = std::make_unique<CycleTimingLog>(std::cerr);
       last_feedback_ = std::chrono::steady_clock::now();
       running_ = true;
       cycle_thread_ = std::thread([this] {cycle();});
@@ -571,15 +679,36 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
   }
   void cycle()
   {
-    auto next = std::chrono::steady_clock::now();
+    using Clock = std::chrono::steady_clock;
+    const auto micros = [](Clock::duration elapsed) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+      };
+    auto next = Clock::now();
+    auto previous_start = Clock::time_point{};
     std::int64_t integral = 0;
     unsigned count = 0;
+    CyclicHealth health;
     while (running_) {
       const auto cycle_count = ++count;
+      const auto start = Clock::now();
+      CycleTiming timing;
+      timing.cycle = cycle_count;
+      timing.start_us = micros(start.time_since_epoch());
+      timing.expected_wkc = expected_wkc_;
+      timing.interval_us = cycle_count > 1 ? micros(start - previous_start) : 0;
+      timing.wake_late_us = std::max<std::int64_t>(0, micros(start - next));
+      previous_start = start;
+      const auto prepare_lock_start = Clock::now();
       {
         std::lock_guard<std::mutex> guard(image_mutex_);
-        if (std::chrono::steady_clock::now() - last_feedback_ > feedback_deadline) {
-          fault_locked("EtherCAT cyclic deadline exceeded (20 ms)");
+        const auto locked = Clock::now();
+        timing.lock_wait_us = micros(locked - prepare_lock_start);
+        timing.feedback_age_us = micros(locked - last_feedback_);
+        if (locked - last_feedback_ > feedback_deadline) {
+          timing.work_us = micros(locked - start);
+          timing.fault = true;
+          fault_locked("EtherCAT cyclic deadline exceeded (20 ms); timing_before_send: " +
+            cycle_timing_text(timing));
         }
         for (auto & entry : images_) {
           std::copy_n(
@@ -588,35 +717,80 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
         }
         sent_generation_ = requested_generation_;
       }
+      const auto send_start = Clock::now();
       ec_send_processdata_group(process_group);
-      const int wkc = ec_receive_processdata_group(process_group, 1000);
+      const auto receive_start = Clock::now();
+      timing.send_us = micros(receive_start - send_start);
+      const int wkc = ec_receive_processdata_group(process_group, receive_timeout_us);
+      timing.receive_us = micros(Clock::now() - receive_start);
+      timing.wkc = wkc;
+      const auto previous_pdo_failures = health.pdo_failures();
+      const auto pdo_decision = health.observe_pdo(wkc, expected_wkc_);
+      timing.pdo_failure_streak = health.pdo_failures();
+      timing.pdo_recovered = previous_pdo_failures > 0 && pdo_decision == HealthDecision::accept;
       std::ostringstream fault;
-      if (wkc != expected_wkc_) {
-        fault << "EtherCAT process WKC mismatch: actual=" << wkc << " expected=" << expected_wkc_;
+      if (pdo_decision == HealthDecision::fault) {
+        fault << "EtherCAT process WKC mismatch: actual=" << wkc << " expected=" << expected_wkc_
+              << " consecutive=" << health.pdo_failures()
+              << " limit=" << CyclicHealth::pdo_failure_limit;
       }
-      if (cycle_count % 10 == 0) {
+      {
+        const auto polls_start = Clock::now();
         for (auto slave : options_.slaves) {
+          if (!health.should_poll_al(cycle_count, slave)) {continue;}
           std::array<std::uint8_t, 6> al{};
+          const auto poll_start = Clock::now();
           const int al_wkc = ec_FPRD(
-            ec_slave[slave].configadr, ECT_REG_ALSTAT, al.size(), al.data(), 1000);
+            ec_slave[slave].configadr, ECT_REG_ALSTAT, al.size(), al.data(), receive_timeout_us);
+          const auto poll_us = micros(Clock::now() - poll_start);
+          ++timing.al_polls;
+          if (poll_us >= timing.al_max_us) {
+            timing.al_max_us = poll_us;
+            timing.al_max_slave = slave;
+          }
           if (al_wkc <= 0) {
-            if (fault.tellp() > 0) {fault << "; ";}
-            fault << "AL poll timeout at slave " << slave << " fprd_wkc=" << al_wkc;
+            const auto decision = health.observe_al(slave, false, false);
+            ++timing.al_timeouts;
+            if (health.al_failures(slave) >= timing.al_failure_streak) {
+              timing.al_failure_streak = health.al_failures(slave);
+              timing.al_failed_slave = slave;
+            }
+            if (decision == HealthDecision::fault) {
+              if (fault.tellp() > 0) {fault << "; ";}
+              fault << "AL poll timeout at slave " << slave << " fprd_wkc=" << al_wkc
+                    << " elapsed_us=" << poll_us << " timeout_us=" << receive_timeout_us
+                    << " consecutive=" << health.al_failures(slave)
+                    << " limit=" << CyclicHealth::al_failure_limit;
+            }
             continue;
           }
           const std::uint16_t state =
             static_cast<std::uint16_t>(al[0]) | (static_cast<std::uint16_t>(al[1]) << 8);
           const std::uint16_t code =
             static_cast<std::uint16_t>(al[4]) | (static_cast<std::uint16_t>(al[5]) << 8);
-          if ((state & 0x1fU) != EC_STATE_OPERATIONAL) {
+          const auto previous_al_failures = health.al_failures(slave);
+          const auto decision = health.observe_al(
+            slave, true, (state & 0x1fU) == EC_STATE_OPERATIONAL && code == 0);
+          if (decision == HealthDecision::fault) {
             if (fault.tellp() > 0) {fault << "; ";}
             fault << "AL non-OP at slave " << slave << " state=" << hex_text(state, 4)
                   << " al=" << hex_text(code, 4);
+          } else if (previous_al_failures > 0) {
+            ++timing.al_recoveries;
           }
         }
+        if (timing.al_polls > 0) {timing.al_total_us = micros(Clock::now() - polls_start);}
       }
       {
+        const auto lock_start = Clock::now();
         std::lock_guard<std::mutex> guard(image_mutex_);
+        const auto locked = Clock::now();
+        timing.lock_wait_us += micros(locked - lock_start);
+        timing.feedback_age_us = micros(locked - last_feedback_);
+        if (CyclicHealth::feedback_expired(locked - last_feedback_)) {
+          if (fault.tellp() > 0) {fault << "; ";}
+          fault << "EtherCAT feedback deadline exceeded (20 ms) before publish";
+        }
         if (fault.tellp() > 0) {
           const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - last_feedback_);
@@ -625,17 +799,24 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
           }
           fault << "; cycle=" << cycle_count << " last_feedback_ms=" << age.count()
                 << "; outputs disabled until process restart";
+          timing.work_us = micros(locked - start);
+          timing.fault = true;
+          fault << "; timing_before_latch: " << cycle_timing_text(timing);
           fault_locked(fault.str());
-        } else {
+        } else if (CyclicHealth::can_publish(
+            wkc, expected_wkc_, locked - last_feedback_, !fault_.empty()))
+        {
           for (auto & entry : images_) {
             std::copy_n(
-              ec_slave[entry.first].inputs, input_bytes(entry.second.layout),
+              ec_slave[entry.first].inputs,
+              input_bytes(entry.second.layout, entry.second.torque_feedback_mapped),
               entry.second.input.begin());
           }
           last_feedback_ = std::chrono::steady_clock::now();
           applied_generation_ = sent_generation_;
           changed_.notify_all();
         }
+        timing.fault = !fault_.empty();
       }
       // Bound the DC PI correction; scheduling is best effort on normal Linux.
       auto phase = (ec_DCtime - 50000) % 2000000;
@@ -646,6 +827,10 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
         -100000, 100000);
       const auto correction = std::clamp<std::int64_t>(-phase / 100 - integral / 20, -50000, 50000);
       next += cycle_period + std::chrono::nanoseconds(correction);
+      const auto end = Clock::now();
+      timing.work_us = micros(end - start);
+      timing.overrun_us = std::max<std::int64_t>(0, micros(end - next));
+      timing_log_->record(timing);
       if (next < std::chrono::steady_clock::now()) {next = std::chrono::steady_clock::now();}
       std::this_thread::sleep_until(next);
     }
@@ -661,12 +846,22 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
         if (image == images_.end()) {
           throw std::invalid_argument("EtherCAT slave was not selected");
         }
-        if (auto field = input_field(image->second.layout, object)) {
+        if (auto field = input_field(
+            image->second.layout, image->second.torque_feedback_mapped, object))
+        {
           SdoResponse result{};
           result.object = object;
           result.size = static_cast<std::uint8_t>(field->bytes);
           std::copy_n(
             image->second.input.begin() + field->offset, field->bytes, result.data.begin());
+          return iswv::Result<SdoResponse>::success(result);
+        }
+        if (object.subindex == 0 && object.index == 0x6076 && image->second.rated_torque_mnm) {
+          SdoResponse result{};
+          result.object = object;
+          result.size = sizeof(std::uint32_t);
+          const auto bytes = iswv::canopen::encode_little_endian(*image->second.rated_torque_mnm);
+          std::copy(bytes.begin(), bytes.end(), result.data.begin());
           return iswv::Result<SdoResponse>::success(result);
         }
       }
@@ -727,12 +922,33 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
       return iswv::Result<void>::failure(iswv::ErrorCode::transport_error, error.what());
     }
   }
+  std::optional<std::int16_t> cached_torque_permille(std::uint16_t slave)
+  {
+    std::lock_guard<std::mutex> guard(image_mutex_);
+    if (!fault_.empty() || !running_) {return {};}
+    const auto image = images_.find(slave);
+    if (image == images_.end() || !image->second.torque_feedback_mapped) {return {};}
+    const auto field = input_field(image->second.layout, true, {0x6077, 0});
+    if (!field) {return {};}
+    auto value = iswv::canopen::decode_little_endian<std::int16_t>(
+      image->second.input.data() + field->offset, field->bytes);
+    if (!value) {return {};}
+    return value.value();
+  }
+  std::optional<std::uint32_t> cached_rated_torque_millinewton_meter(std::uint16_t slave)
+  {
+    std::lock_guard<std::mutex> guard(image_mutex_);
+    if (!fault_.empty() || !running_) {return {};}
+    const auto image = images_.find(slave);
+    if (image == images_.end()) {return {};}
+    return image->second.rated_torque_mnm;
+  }
   void close() noexcept
   {
     running_ = false;
     changed_.notify_all();
     if (cycle_thread_.joinable()) {cycle_thread_.join();}
-    if (!opened_) {return;}
+    if (!opened_) {timing_log_.reset(); return;}
     for (auto & entry : images_) {
       const auto slave = entry.first;
       if (ec_slave[slave].outputs && ec_slave[slave].Obytes == output_bytes(entry.second.layout)) {
@@ -751,6 +967,7 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
     }
     ec_close();
     opened_ = false;
+    timing_log_.reset();
   }
 
   std::unique_lock<std::mutex> exclusive_;
@@ -763,6 +980,7 @@ struct Master::Impl : public std::enable_shared_from_this<Master::Impl>
   std::mutex mailbox_mutex_;
   std::condition_variable changed_;
   std::thread cycle_thread_;
+  std::unique_ptr<CycleTimingLog> timing_log_;
   std::string fault_;
   int expected_wkc_{0};
   std::uint64_t requested_generation_{0}, sent_generation_{0}, applied_generation_{0};

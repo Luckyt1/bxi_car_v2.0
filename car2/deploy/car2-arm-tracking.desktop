@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Arm tracking camera
+Name[zh_CN]=机械臂跟踪相机
+Comment=Disabled: camera runs through car2-arm-tracking.service
+Exec=/usr/bin/systemd-cat --identifier=car2-arm-tracking /bin/bash /opt/bxi_car/car2/start_arm_tracking.sh --joystick --tracking-mode approach --print-hz 0.2
+Path=/opt/bxi_car/car2
+Icon=camera-video
+Terminal=false
+X-GNOME-Autostart-enabled=false

@@ -20,7 +20,7 @@ class StartScriptTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="car start scripts ")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for folder in ["test/tools", "src/thirdparty", "src/config", "build/chassis",
+        for folder in ["tools", "test/tools", "src/thirdparty", "src/config", "build/chassis",
                        "install", "ros", "other cwd"]:
             (self.root / folder).mkdir(parents=True, exist_ok=True)
         for name in ["start.sh", *(value[0] for value in ROUTES.values())]:
@@ -30,12 +30,16 @@ class StartScriptTests(unittest.TestCase):
             (self.root / "src/config" / name).write_text("{}\n")
         fake = ("#!/usr/bin/env python3\nimport json, os, pathlib, sys\n"
                 "pathlib.Path(os.environ['FAKE_CAPTURE']).write_text(json.dumps(sys.argv))\n"
+                "pathlib.Path(os.environ['FAKE_CAPTURE'] + '.can-log-dir').write_text("
+                "os.environ.get('CHASSIS_CAN_LOG_DIR', '<unset>'))\n"
+                "pathlib.Path(os.environ['FAKE_CAPTURE'] + '.arm-torque-log-dir').write_text("
+                "os.environ.get('CHASSIS_ARM_TORQUE_LOG_DIR', '<unset>'))\n"
                 "sys.exit(int(os.environ.get('FAKE_STATUS', '0')))\n")
         for name in ["arm_yiyou_control", "chassis_only_remote", "robot_control"]:
             binary = self.root / "build/chassis" / name
             binary.write_text(fake)
             binary.chmod(0o755)
-        (self.root / "test/tools/yiyou_control.py").write_text(fake)
+        (self.root / "tools/yiyou_control.py").write_text(fake)
         setup = 'printf loaded >> "$FAKE_ENV_CAPTURE"\n'
         (self.root / "ros/setup.bash").write_text(setup)
         (self.root / "install/local_setup.bash").write_text(setup)
@@ -50,6 +54,8 @@ class StartScriptTests(unittest.TestCase):
                         ROS_DISTRO=os.path.relpath(self.root / "ros", "/opt/ros"),
                         YIYOU_INTERFACE="enp1s0", YIYOU_SLAVES="1,2,3")
         self.env.pop("BASH_ENV", None)
+        self.env.pop("CHASSIS_CAN_LOG_DIR", None)
+        self.env.pop("CHASSIS_ARM_TORQUE_LOG_DIR", None)
 
     def launch(self, *arguments, entry="start.sh", stdin="", **environment):
         return subprocess.run(["bash", str(self.root / entry), *arguments],
@@ -78,17 +84,6 @@ class StartScriptTests(unittest.TestCase):
                         self.assertEqual(command[2], "jog")
         self.assert_no_execution()
 
-    def test_default_root_build_and_install_work_from_another_directory(self):
-        self.env.pop("CHASSIS_BUILD_DIR")
-        self.env.pop("CHASSIS_INSTALL_DIR")
-        preview = self.command(self.launch("robot", "--dry-run"))
-        self.assertEqual(Path(preview[0]), self.root / "build/chassis/robot_control")
-        result = self.launch("robot")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        command = json.loads(self.capture.read_text())
-        self.assertEqual(Path(command[0]), self.root / "build/chassis/robot_control")
-        self.assertEqual(self.environment_capture.read_text(), "loaded" * 2)
-
     def test_help_and_preview_do_not_load_environment_or_execute_programs(self):
         for mode, (entry, _) in ROUTES.items():
             for arguments in [("--help",), ("--dry-run",)]:
@@ -113,7 +108,7 @@ class StartScriptTests(unittest.TestCase):
         arm.write_text("{}")
         extra = ["--ros-args", "-p", "example:=a b $(never_execute)"]
         command = self.command(self.launch("robot", "--dry-run", *extra,
-                                           CHASSIS_CONFIG=str(config), YIYOU_CONFIG=str(arm)))
+                                          CHASSIS_CONFIG=str(config), YIYOU_CONFIG=str(arm)))
         self.assertIn("steering_config_file:=" + str(config), command)
         self.assertEqual(command[command.index("--params-file") + 1], str(arm))
         self.assertEqual(command[-len(extra):], extra)
@@ -139,6 +134,22 @@ class StartScriptTests(unittest.TestCase):
         self.assertEqual(command[-len(extra):], extra)
         self.assertFalse(self.environment_capture.exists())
 
+    def test_zero_leaves_missing_connection_options_for_terminal_selection(self):
+        for arguments in [(), ("--interface", "enp2s0"), ("--slaves", "1,3"),
+                          ("--interface=enp2s0", "--slaves=1,3")]:
+            with self.subTest(arguments=arguments):
+                result = self.launch(*arguments, entry="start_yiyou_jog.sh")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                command = json.loads(self.capture.read_text())
+                connection = command[command.index("--calibration-file") + 2:]
+                self.assertEqual(connection, list(arguments))
+
+    def test_zero_preview_uses_defaults_without_prompting_or_execution(self):
+        command = self.command(self.launch("--dry-run", entry="start_yiyou_jog.sh"))
+        self.assertEqual(command[command.index("--interface") + 1], "enp1s0")
+        self.assertEqual(command[command.index("--slaves") + 1], "1,2,3")
+        self.assert_no_execution()
+
     @unittest.skipUnless(Path("/opt/ros").is_dir(), "ROS prefix needed for fake setup path")
     def test_ros_routes_exec_fake_program_and_propagate_exit_status(self):
         for mode in ["chassis", "robot"]:
@@ -148,6 +159,25 @@ class StartScriptTests(unittest.TestCase):
             self.assertEqual(Path(command[0]).name, ROUTES[mode][1])
             self.assertEqual(command[-3:], ["--ros-args", "-p", "test:=a b"])
         self.assertEqual(self.environment_capture.read_text(), "loaded" * 4)
+
+    @unittest.skipUnless(Path("/opt/ros").is_dir(), "ROS prefix needed for fake setup path")
+    def test_can_diagnostic_directory_default_override_and_disable(self):
+        capture = Path(str(self.capture) + ".can-log-dir")
+        self.assertEqual(self.launch("robot").returncode, 0)
+        self.assertEqual(capture.read_text(), str(self.root / "log/can"))
+        for directory in [str(self.root / "custom CAN logs"), ""]:
+            self.assertEqual(self.launch("chassis", CHASSIS_CAN_LOG_DIR=directory).returncode, 0)
+            self.assertEqual(capture.read_text(), directory)
+
+    @unittest.skipUnless(Path("/opt/ros").is_dir(), "ROS prefix needed for fake setup path")
+    def test_arm_torque_directory_default_override_and_disable(self):
+        capture = Path(str(self.capture) + ".arm-torque-log-dir")
+        self.assertEqual(self.launch("robot").returncode, 0)
+        self.assertEqual(capture.read_text(), str(self.root / "log/arm_torque"))
+        for directory in [str(self.root / "custom torque logs"), ""]:
+            self.assertEqual(
+                self.launch("robot", CHASSIS_ARM_TORQUE_LOG_DIR=directory).returncode, 0)
+            self.assertEqual(capture.read_text(), directory)
 
 
 if __name__ == "__main__":

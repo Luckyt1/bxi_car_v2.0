@@ -2,7 +2,7 @@
 #include "motor/bxi/motor.h"
 #include "motor/yiyou/communication.h"
 #include "chassis/steering_target_limits.hpp"
-#include "../support/bxi_fake_transport.h"
+#include "iswv/fake_transport.hpp"
 
 #include <algorithm>
 #include <array>
@@ -65,13 +65,13 @@ void bxi_command_endpoints()
   collision.torque = 4092.0F;
   const auto packed_collision = bxi::pack_command(collision);
   require(
-    !packed_collision && packed_collision.error().code == bxi::ErrorCode::invalid_argument,
+    !packed_collision && packed_collision.error().code == iswv::ErrorCode::invalid_argument,
     "ordinary command cannot encode the enter-mode control frame");
 }
 
 void bxi_invalid_commands_send_nothing()
 {
-  bxi_test::FakeTransport transport;
+  iswv::FakeTransport transport;
   bxi::Motor motor(transport, 0x123);
   std::array<bxi::Command, 8> invalid{};
   invalid[0].position = 12.6F;
@@ -85,7 +85,7 @@ void bxi_invalid_commands_send_nothing()
   for (const auto & command : invalid) {
     const auto result = motor.command(command);
     require(
-      !result && result.error().code == bxi::ErrorCode::invalid_argument,
+      !result && result.error().code == iswv::ErrorCode::invalid_argument,
       "invalid MIT command must return invalid_argument");
     require(transport.sent_frames().empty(), "invalid command must not reach transport");
   }
@@ -93,117 +93,9 @@ void bxi_invalid_commands_send_nothing()
   require(transport.sent_frames().size() == 1, "valid command sends exactly one frame");
 }
 
-void bxi_control_helpers_send_mit_frames()
-{
-  bxi_test::FakeTransport transport;
-  bxi::Motor motor(transport, 0x123, {false, false});
-  require(
-    motor.set_velocity(-45.0F, 5.0F, bxi::Model::BXI5014_19).has_value(),
-    "velocity control sends");
-  require(
-    motor.set_position(12.5F, 500.0F, 5.0F, bxi::Model::BXI5014_19).has_value(),
-    "position control sends");
-  require(
-    motor.set_torque(160.0F, bxi::Model::BXI8515_19).has_value(),
-    "torque control uses the selected model range");
-  const auto frames = transport.sent_frames();
-  // Independent wire expectations: unused targets encode zero; inactive gains encode zero.
-  const std::array<std::array<std::uint8_t, 8>, 3> expected{{
-    {0x7f, 0xff, 0x00, 0x00, 0x00, 0xff, 0xf7, 0xff},
-    {0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xf7, 0xff},
-    {0x7f, 0xff, 0x7f, 0xf0, 0x00, 0x00, 0x0f, 0xff}}};
-  require(frames.size() == expected.size(), "each control call sends exactly one frame");
-  for (std::size_t i = 0; i < frames.size(); ++i) {
-    require(
-      frames[i].id == 0x123 && frames[i].size == 8 &&
-      !frames[i].fd && !frames[i].bitrate_switch,
-      "control helpers preserve motor ID and CAN options");
-    require(
-      std::equal(expected[i].begin(), expected[i].end(), frames[i].data.begin()),
-      "control helper MIT fields match the requested control type");
-  }
-}
-
-void bxi_control_helpers_select_model_ranges()
-{
-  struct ModelLimits
-  {
-    bxi::Model model;
-    float kd_max;
-    float torque_max;
-  };
-  const std::array<ModelLimits, 4> models{{
-    {bxi::Model::BXI5014_19, 5.0F, 40.0F},
-    {bxi::Model::BXI5018_19, 5.0F, 40.0F},
-    {bxi::Model::BXI7010_19, 5.0F, 80.0F},
-    {bxi::Model::BXI8515_19, 20.0F, 160.0F}}};
-  bxi_test::FakeTransport transport;
-  bxi::Motor motor(transport, 1);
-  for (const auto & item : models) {
-    transport.clear_sent();
-    require(
-      motor.set_velocity(0.0F, item.kd_max, item.model).has_value(),
-      "velocity accepts this model's maximum kd");
-    require(
-      motor.set_position(0.0F, 1.0F, item.kd_max, item.model).has_value(),
-      "position accepts this model's maximum kd");
-    require(
-      motor.set_torque(item.torque_max, item.model).has_value(),
-      "torque accepts this model's maximum torque");
-    const auto frames = transport.sent_frames();
-    require(frames.size() == 3, "each model sends three control frames");
-    for (std::size_t i = 0; i < 2; ++i) {
-      require(
-        frames[i].data[5] == 0xff && (frames[i].data[6] >> 4) == 0x0f,
-        "maximum kd uses the full 12-bit field for this model");
-    }
-    require(
-      (frames[2].data[6] & 0x0f) == 0x0f && frames[2].data[7] == 0xff,
-      "maximum torque uses the full 12-bit field for this model");
-    require(
-      !motor.set_velocity(0.0F, item.kd_max + 1.0F, item.model) &&
-      !motor.set_position(0.0F, 1.0F, item.kd_max + 1.0F, item.model) &&
-      !motor.set_torque(item.torque_max + 1.0F, item.model),
-      "control helpers reject values outside this model's ranges");
-    require(transport.sent_frames().size() == 3, "out-of-range values send nothing");
-  }
-}
-
-void bxi_control_helpers_reject_invalid_and_propagate_errors()
-{
-  bxi_test::FakeTransport transport;
-  bxi::Motor motor(transport, 1);
-  const auto model = bxi::Model::BXI5014_19;
-  const auto nan = std::numeric_limits<float>::quiet_NaN();
-  const std::array<bxi::Result<void>, 6> invalid{
-    motor.set_velocity(46.0F, 1.0F, model), motor.set_velocity(1.0F, nan, model),
-    motor.set_position(13.0F, 1.0F, 1.0F, model),
-    motor.set_position(0.0F, -1.0F, 1.0F, model),
-    motor.set_torque(41.0F, model), motor.set_torque(nan, model)};
-  for (const auto & result : invalid) {
-    require(
-      !result && result.error().code == bxi::ErrorCode::invalid_argument,
-      "control helpers reject invalid targets and gains");
-  }
-  const auto unknown = static_cast<bxi::Model>(-1);
-  rejects([&] {motor.set_velocity(0.0F, 1.0F, unknown);});
-  rejects([&] {motor.set_position(0.0F, 1.0F, 1.0F, unknown);});
-  rejects([&] {motor.set_torque(0.0F, unknown);});
-  require(transport.sent_frames().empty(), "invalid control calls send nothing");
-  transport.close();
-  const std::array<bxi::Result<void>, 3> closed{
-    motor.set_velocity(0.0F, 1.0F, model), motor.set_position(0.0F, 1.0F, 1.0F, model),
-    motor.set_torque(0.0F, model)};
-  for (const auto & result : closed) {
-    require(
-      !result && result.error().code == bxi::ErrorCode::transport_closed,
-      "control helpers propagate transport errors");
-  }
-}
-
 void bxi_explicit_enable_disable_frames()
 {
-  bxi_test::FakeTransport transport;
+  iswv::FakeTransport transport;
   {
     bxi::Motor motor(transport, 0x7ff, {false, false});
     require(transport.sent_frames().empty(), "construction must not enable a motor");
@@ -229,7 +121,7 @@ void bxi_explicit_enable_disable_frames()
 
 void bxi_feedback_boundaries_and_validation()
 {
-  bxi::CanFrame frame{};
+  iswv::CanFrame frame{};
   frame.id = 0x11;
   frame.size = 5;
   frame.data[0] = 7;
@@ -252,7 +144,7 @@ void bxi_feedback_boundaries_and_validation()
     if (kind == 4) {invalid.id = 0x800;}
     const auto result = bxi::decode_feedback(invalid);
     require(
-      !result && result.error().code == bxi::ErrorCode::protocol_error,
+      !result && result.error().code == iswv::ErrorCode::protocol_error,
       "malformed feedback must return protocol_error");
   }
 }
@@ -339,12 +231,9 @@ void ethercat_selection_is_validated_offline()
 
 int main()
 {
-  const std::array<std::pair<const char *, void (*)()>, 10> tests{{
+  const std::array<std::pair<const char *, void (*)()>, 7> tests{{
     {"BXI command endpoints", bxi_command_endpoints},
     {"BXI invalid commands send nothing", bxi_invalid_commands_send_nothing},
-    {"BXI control helper MIT frames", bxi_control_helpers_send_mit_frames},
-    {"BXI control helper model ranges", bxi_control_helpers_select_model_ranges},
-    {"BXI control helper errors", bxi_control_helpers_reject_invalid_and_propagate_errors},
     {"BXI explicit enable/disable frames", bxi_explicit_enable_disable_frames},
     {"BXI feedback boundaries and validation", bxi_feedback_boundaries_and_validation},
     {"arm FK/IK round trip", arm_forward_inverse_round_trip},

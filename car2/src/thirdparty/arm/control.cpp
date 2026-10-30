@@ -68,6 +68,12 @@ void validate_arm_motion_config(const ArmMotionConfig & motion)
   {
     throw std::invalid_argument("invalid arm profile speed/acceleration");
   }
+  if (!std::isfinite(motion.fourth_speed_rpm) || motion.fourth_speed_rpm <= 0 ||
+    motion.fourth_speed_rpm >= 60 || !std::isfinite(motion.fourth_acceleration_rpm_s) ||
+    motion.fourth_acceleration_rpm_s <= 0)
+  {
+    throw std::invalid_argument("invalid fourth-axis profile speed/acceleration");
+  }
   for (const auto direction : motion.motor_directions) {
     if (direction != -1 && direction != 1) {
       throw std::invalid_argument("arm motor directions must be -1 or 1");
@@ -77,17 +83,20 @@ void validate_arm_motion_config(const ArmMotionConfig & motion)
 
 ArmController::ArmController(
   std::shared_ptr<ethercat::Master> master, std::array<std::uint16_t, 3> positions,
-  std::function<void()> power_off, std::optional<std::uint16_t> current_position,
+  std::function<void()> power_off, std::optional<std::uint16_t> fourth_position,
   const ArmMotionConfig & motion)
 : ArmController(selected_nodes(master, positions), std::move(power_off),
-    current_position && master ? master->node(*current_position) : nullptr, motion)
+    fourth_position && master ? master->node(*fourth_position) : nullptr, motion)
 {
   master_ = std::move(master);
+  if (fourth_motor_ && motion.fourth_position_memory_file.empty()) {
+    throw std::invalid_argument("fourth-axis position memory file is required on hardware");
+  }
 }
 
 ArmController::ArmController(
   std::array<std::shared_ptr<ethercat::Node>, 3> nodes, std::function<void()> power_off,
-  std::shared_ptr<ethercat::Node> current_node, const ArmMotionConfig & motion)
+  std::shared_ptr<ethercat::Node> fourth_node, const ArmMotionConfig & motion)
 : motors_{YiyouMotor(nodes[0]), YiyouMotor(nodes[1]), YiyouMotor(nodes[2])},
   motion_config_(motion), kinematics_(motion.kinematics),
   power_off_(std::move(power_off))
@@ -100,13 +109,14 @@ ArmController::ArmController(
       }
     }
   }
-  if (current_node) {
+  if (fourth_node) {
     for (const auto & node : nodes) {
-      if (node->id() == current_node->id()) {
-        throw std::invalid_argument("CST fourth axis must have a distinct slave position");
+      if (node->id() == fourth_node->id()) {
+        throw std::invalid_argument("PP fourth axis must have a distinct slave position");
       }
     }
-    current_motor_ = std::make_unique<YiyouMotor>(std::move(current_node));
+    fourth_node_ = std::move(fourth_node);
+    fourth_motor_ = std::make_unique<YiyouMotor>(fourth_node_);
   }
 }
 
@@ -126,10 +136,29 @@ void ArmController::initialize()
       hold_positions_[i] = motors_[i].actual_position();
       actual_positions_[i] = hold_positions_[i];
     }
-    if (current_motor_) {
-      current_axis_position_scale_ = current_motor_->configure_rpm_units();
-      (void)current_motor_->actual_current_permille();
-      current_axis_position_pulses_ = current_motor_->actual_position();
+    if (fourth_motor_) {
+      fourth_axis_position_scale_ = fourth_motor_->configure_rpm_units();
+      fourth_raw_position_ = fourth_motor_->actual_position();
+      if (!motion_config_.fourth_position_memory_file.empty()) {
+        std::array<std::uint32_t, 4> identity{};
+        for (std::uint8_t sub = 1; sub <= identity.size(); ++sub) {
+          const auto value = fourth_node_->read(
+            iswv::canopen::Object<std::uint32_t>{{0x1018, sub}, "position memory identity"});
+          if (!value) {throw std::runtime_error("cannot read fourth-axis identity for position memory");}
+          identity[sub - 1] = value.value();
+        }
+        fourth_memory_ = std::make_unique<PositionMemory>(
+          motion_config_.fourth_position_memory_file, motion_config_.ethercat_interface,
+          fourth_node_->id(), identity, fourth_axis_position_scale_);
+        fourth_axis_position_pulses_ = fourth_memory_->restore(fourth_raw_position_);
+      } else {
+        fourth_axis_position_pulses_ = fourth_raw_position_;
+      }
+      const double upper = std::floor(fourth_axis_position_scale_ * 1200.0 / 360.0);
+      if (upper < 1 || upper > std::numeric_limits<std::int32_t>::max()) {
+        throw std::invalid_argument("fourth-axis 1200 degree limit exceeds encoder range");
+      }
+      fourth_upper_pulses_ = static_cast<std::int32_t>(upper);
     }
     for (std::size_t i = 0; i < motors_.size(); ++i) {
       auto & motor = motors_[i];
@@ -140,9 +169,16 @@ void ArmController::initialize()
       motor.enable_position(speed, acceleration, acceleration);
       motor.move_to_position(hold_positions_[i]);
     }
-    if (current_motor_) {
-      current_motor_->enable_cst();
-      target_current_ = 0;
+    if (fourth_motor_) {
+      const auto speed = static_cast<std::uint32_t>(
+        fourth_motor_->velocity_from_rpm(motion_config_.fourth_speed_rpm));
+      const auto acceleration = static_cast<std::uint32_t>(
+        fourth_motor_->velocity_from_rpm(motion_config_.fourth_acceleration_rpm_s));
+      fourth_motor_->enable_position(speed, acceleration, acceleration);
+      // Seed/accept the measured position, including an already-outside startup.
+      read_fourth_position();
+      fourth_motor_->move_to_position(fourth_raw_position_);
+      halt_fourth_axis();
     }
     initialized_ = true;
     accepted_joints_ = actual_joints();
@@ -162,7 +198,9 @@ void ArmController::return_to_zero(
 {
   if (!fault_reason_.empty()) {throw std::logic_error(fault_reason_);}
   if (!initialized_) {throw std::logic_error("initialize EtherCAT arm before returning to zero");}
-  if (position_command_pending() || timeout <= std::chrono::milliseconds::zero()) {
+  if (position_command_pending() || planar_halt_pending_ ||
+    timeout <= std::chrono::milliseconds::zero())
+  {
     throw std::invalid_argument("return to zero requires idle commands and a positive timeout");
   }
   try {
@@ -185,6 +223,7 @@ void ArmController::return_to_zero(
     // Reuse the all-axis staged/readback/acknowledgement path and configured PP limits.
     pending_positions_ = position_targets({0, 0, 0});
     pending_joints_ = {0, 0, 0};
+    planar_halted_ = false;
     position_phase_ = PositionPhase::queued;
     while (true) {
       if (keep_running && !keep_running()) {
@@ -233,21 +272,33 @@ void ArmController::update(std::chrono::steady_clock::time_point now)
                 " feedback speed reaches 60 RPM; motor power off requested");
       }
     }
-    if (current_motor_) {
-      current_motor_->check_current_mode();
-      actual_current_ = current_motor_->actual_current_permille();
-      current_axis_position_pulses_ = current_motor_->actual_position();
-      current_axis_rpm_ = current_motor_->actual_velocity_rpm();
-      if (std::abs(current_axis_rpm_) >= 60.0) {
+    if (planar_halt_pending_) {
+      bool stopped = true;
+      for (std::size_t i = 0; i < motors_.size(); ++i) {
+        if (std::abs(actual_rpm_[i]) >= 0.1 || !motors_[i].motion_stopped()) {
+          stopped = false;
+        }
+      }
+      if (stopped) {
+        accepted_joints_ = actual_joints();
+        hold_positions_ = actual_positions_;
+        planar_halt_pending_ = false;
+      }
+    }
+    if (fourth_motor_) {
+      fourth_motor_->check_position_mode();
+      if (fourth_memory_) {(void)fourth_memory_->poll();}
+      read_fourth_position();
+      fourth_axis_rpm_ = fourth_motor_->actual_velocity_rpm();
+      if (std::abs(fourth_axis_rpm_) >= 60.0) {
         throw std::runtime_error(
                 "EtherCAT motor 4 feedback speed reaches 60 RPM; motor power off requested");
       }
-      if (current_direction_blocked(target_current_)) {
-        current_motor_->set_current_permille(0);
-        target_current_ = 0;
-      }
+      if (fourth_direction_blocked(fourth_direction_)) {halt_fourth_axis();}
+      advance_fourth_position(now);
     }
     advance_position_command(now);
+    publish_torque_sample(now);
     next_feedback_ = now + std::chrono::milliseconds(20);
   } catch (const std::exception & error) {
     latch_fault(error.what());
@@ -268,21 +319,29 @@ std::string ArmController::take_feedback_diagnostic(std::chrono::steady_clock::t
         << " actual_position_pulses=" << actual_positions_[i]
         << " velocity_rpm=" << actual_rpm_[i];
   }
-  if (current_motor_) {
-    out << '\n' << "ETHERCAT_YIYOU_CST motor_id=4"
-        << " target_current_permille=" << target_current_
-        << " actual_current_permille=" << actual_current_
-        << " actual_position_pulses=" << current_axis_position_pulses_
+  if (fourth_motor_) {
+    out << '\n' << "ETHERCAT_YIYOU_PP motor_id=4"
+        << " jog_direction=" << fourth_direction_
+        << " target_position_pulses=" << fourth_target_.value_or(fourth_axis_position_pulses_)
+        << " profile_speed_rpm=" << motion_config_.fourth_speed_rpm
+        << " actual_position_pulses=" << fourth_axis_position_pulses_
+        << " raw_position_pulses=" << fourth_raw_position_
+        << " position_memory=" << bool(fourth_memory_)
         << " actual_position_degrees=" <<
-      static_cast<double>(current_axis_position_pulses_) * 360.0 / current_axis_position_scale_
-        << " velocity_rpm=" << current_axis_rpm_
-        << " negative_inhibited=" << current_direction_blocked(-1)
-        << " positive_inhibited=" << current_direction_blocked(1);
+      static_cast<double>(fourth_axis_position_pulses_) * 360.0 / fourth_axis_position_scale_
+        << " velocity_rpm=" << fourth_axis_rpm_
+        << " negative_inhibited=" << fourth_direction_blocked(-1)
+        << " positive_inhibited=" << fourth_direction_blocked(1);
   }
   const auto pose = actual_pose();
   out << '\n' << "ETHERCAT_YIYOU_POSE x_m=" << pose.x << " z_m=" << pose.z
       << " pitch_rad=" << pose.pitch << " pending=" << position_command_pending();
   return out.str();
+}
+
+void ArmController::set_torque_observer(std::function<void(const ArmTorqueSample &)> observer)
+{
+  torque_observer_ = std::move(observer);
 }
 
 void ArmController::set_target_degrees(std::uint32_t id, double degrees)
@@ -325,6 +384,32 @@ bool ArmController::position_command_pending() const noexcept
   return position_phase_ != PositionPhase::idle;
 }
 
+void ArmController::halt_planar_position()
+{
+  if (!fault_reason_.empty()) {throw std::logic_error(fault_reason_);}
+  if (!initialized_) {throw std::logic_error("initialize EtherCAT arm first");}
+  if (planar_halted_) {return;}
+  // Cancel the group before touching any drive, including staged but untriggered work.
+  position_phase_ = PositionPhase::idle;
+  planar_halted_ = true;
+  planar_halt_pending_ = true;
+  next_feedback_ = {};
+  try {
+    std::exception_ptr first_error;
+    for (auto & motor : motors_) {
+      try {
+        motor.halt_position();
+      } catch (...) {
+        if (!first_error) {first_error = std::current_exception();}
+      }
+    }
+    if (first_error) {std::rethrow_exception(first_error);}
+  } catch (const std::exception & error) {
+    latch_fault(error.what());
+    throw;
+  }
+}
+
 std::array<std::int32_t, 3> ArmController::position_targets(const arm::JointAngles & joints) const
 {
   std::array<std::int32_t, 3> positions{};
@@ -354,6 +439,9 @@ arm::JointAngles ArmController::validate_target_pose(const arm::Pose & pose) con
 {
   if (!fault_reason_.empty()) {throw std::invalid_argument(fault_reason_);}
   if (!initialized_) {throw std::invalid_argument("initialize EtherCAT arm first");}
+  if (planar_halt_pending_) {
+    throw std::invalid_argument("arm planar halt is settling");
+  }
   if (position_command_pending()) {
     throw std::invalid_argument("arm position handshake is pending");
   }
@@ -391,6 +479,7 @@ void ArmController::set_target_pose(const arm::Pose & pose)
   const auto positions = position_targets(joints);
   pending_joints_ = joints;
   pending_positions_ = positions;
+  planar_halted_ = false;
   position_phase_ = PositionPhase::queued;
 }
 
@@ -437,32 +526,108 @@ void ArmController::advance_position_command(std::chrono::steady_clock::time_poi
   }
 }
 
-bool ArmController::current_direction_blocked(std::int64_t current) const
+bool ArmController::fourth_direction_blocked(int direction) const
 {
-  const double degrees =
-    static_cast<double>(current_axis_position_pulses_) * 360.0 / current_axis_position_scale_;
-  return (degrees < 0.0 && current < 0) || (degrees > 1300.0 && current > 0);
+  return (fourth_axis_position_pulses_ <= 0 && direction < 0) ||
+         (fourth_axis_position_pulses_ >= fourth_upper_pulses_ && direction > 0);
 }
 
-void ArmController::set_current_permille(std::int64_t current)
+void ArmController::halt_fourth_axis()
 {
-  if (current < -1000 || current > 1000) {
-    throw std::invalid_argument("fourth-axis current must be in [-1000, 1000] permille");
-  }
+  fourth_direction_ = 0;
+  fourth_phase_ = PositionPhase::idle;
+  fourth_target_.reset();
+  fourth_motor_->halt_position();
+  fourth_waiting_for_stop_ = true;
+}
+
+void ArmController::set_fourth_axis_jog(int direction)
+{
   if (!fault_reason_.empty()) {throw std::logic_error(fault_reason_);}
   if (!initialized_) {throw std::logic_error("initialize EtherCAT arm first");}
-  if (!current_motor_) {throw std::logic_error("no fourth CST axis configured");}
+  if (!fourth_motor_) {throw std::logic_error("no fourth PP axis configured");}
   try {
+    if (direction < -1 || direction > 1) {
+      halt_fourth_axis();
+      throw std::invalid_argument("fourth-axis jog direction must be -1, 0 or 1");
+    }
     if (master_) {master_->check_health();}
-    // Check fresh cached PDO position for every command, including reversals.
-    current_axis_position_pulses_ = current_motor_->actual_position();
-    if (current_direction_blocked(current)) {current = 0;}
-    current_motor_->set_current_permille(static_cast<std::int16_t>(current));
-    target_current_ = static_cast<std::int16_t>(current);
+    read_fourth_position();
+    if (fourth_direction_blocked(direction)) {direction = 0;}
+    if (direction == fourth_direction_) {return;}
+    // Cancel an in-flight handshake on release or reversal. Preparation keeps
+    // halt asserted until a newly staged/read-back target is safe to trigger.
+    halt_fourth_axis();
+    fourth_direction_ = direction;
   } catch (const std::exception & error) {
     latch_fault(error.what());
     throw;
   }
+}
+
+void ArmController::advance_fourth_position(std::chrono::steady_clock::time_point now)
+{
+  if (fourth_direction_ == 0) {return;}
+  // Preserve the old motion envelope during halt deceleration. A new direction
+  // may replace its target only after the drive confirms that motion stopped.
+  if (fourth_waiting_for_stop_) {
+    if (std::abs(fourth_axis_rpm_) >= 0.1 || !fourth_motor_->motion_stopped()) {return;}
+    fourth_waiting_for_stop_ = false;
+  }
+  if (fourth_phase_ != PositionPhase::idle && now >= fourth_deadline_) {
+    throw std::runtime_error("fourth-axis PP command acknowledgement timed out");
+  }
+  switch (fourth_phase_) {
+    case PositionPhase::idle: {
+        // A cancelled write can still complete. Never start a second reservation
+        // until it has been acknowledged, including after release/reversal.
+        if (fourth_memory_ && fourth_memory_->pending()) {return;}
+        // Half a second of travel ahead of measured position, never an accumulated
+        // target. A stalled motor cannot build an arbitrarily long queued move.
+        const auto step = std::max<std::int64_t>(1, std::llround(
+          fourth_axis_position_scale_ * motion_config_.fourth_speed_rpm / 120.0));
+        const auto actual = static_cast<std::int64_t>(fourth_axis_position_pulses_);
+        auto target = actual + fourth_direction_ * step;
+        if (fourth_direction_ > 0) {target = std::min<std::int64_t>(target, fourth_upper_pulses_);}
+        else {target = std::max<std::int64_t>(target, 0);}
+        // Outside starts move inward in bounded steps; never jump to a boundary.
+        if (fourth_target_ && *fourth_target_ == target) {return;}
+        fourth_target_ = target;
+        fourth_deadline_ = now + std::chrono::seconds(1);
+        if (fourth_memory_) {
+          fourth_memory_->queue_target(fourth_raw_position_, target);
+          fourth_phase_ = PositionPhase::queued;
+        } else {
+          fourth_motor_->prepare_position_command(static_cast<std::int32_t>(target));
+          fourth_phase_ = PositionPhase::staging;
+        }
+        break;
+      }
+    case PositionPhase::queued:
+      if (!fourth_memory_->pending()) {
+        fourth_motor_->prepare_position_command(fourth_memory_->raw_target(*fourth_target_));
+        fourth_phase_ = PositionPhase::staging;
+      }
+      break;
+    case PositionPhase::staging:
+      if (fourth_motor_->stage_position_command()) {fourth_phase_ = PositionPhase::triggering;}
+      break;
+    case PositionPhase::triggering:
+      if (fourth_memory_) {fourth_memory_->mark_target(*fourth_target_);}
+      fourth_motor_->trigger_position_command();
+      fourth_phase_ = PositionPhase::acknowledging;
+      break;
+    case PositionPhase::acknowledging:
+      if (fourth_motor_->finish_position_command()) {fourth_phase_ = PositionPhase::idle;}
+      break;
+  }
+}
+
+void ArmController::read_fourth_position()
+{
+  fourth_raw_position_ = fourth_motor_->actual_position();
+  fourth_axis_position_pulses_ = fourth_memory_ ?
+    fourth_memory_->logical_position(fourth_raw_position_) : fourth_raw_position_;
 }
 
 std::string ArmController::fault_reason() const
@@ -474,11 +639,15 @@ void ArmController::stop()
 {
   initialized_ = false;
   position_phase_ = PositionPhase::idle;
+  planar_halted_ = false;
+  planar_halt_pending_ = false;
   std::exception_ptr first_error;
-  if (current_motor_) {
+  if (fourth_motor_) {
     try {
-      current_motor_->stop();
-      target_current_ = 0;
+      fourth_motor_->stop();
+      fourth_direction_ = 0;
+      fourth_phase_ = PositionPhase::idle;
+      fourth_target_.reset();
     } catch (...) {
       first_error = std::current_exception();
     }
@@ -515,6 +684,25 @@ void ArmController::latch_fault(const std::string & reason)
     }
   }
   stop_noexcept();
+}
+
+void ArmController::publish_torque_sample(std::chrono::steady_clock::time_point now) noexcept
+{
+  if (!motion_config_.monitor_torque || !torque_observer_) {return;}
+  try {
+    ArmTorqueSample sample;
+    sample.sampled_at = now;
+    for (std::size_t i = 0; i < motors_.size(); ++i) {
+      sample.permille[i] = motors_[i].actual_torque_permille();
+      sample.rated_mnm[i] = motors_[i].rated_torque_millinewton_meter();
+    }
+    if (fourth_motor_) {
+      sample.permille[3] = fourth_motor_->actual_torque_permille();
+      sample.rated_mnm[3] = fourth_motor_->rated_torque_millinewton_meter();
+    }
+    torque_observer_(sample);
+  } catch (...) {
+  }
 }
 
 }  // namespace chassis

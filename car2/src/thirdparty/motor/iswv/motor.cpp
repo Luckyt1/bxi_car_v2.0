@@ -374,7 +374,15 @@ void IswvDrive::enable_rpm(
   double acceleration_output_rpm_s,
   double deceleration_output_rpm_s)
 {
-  enable_rpm(acceleration_output_rpm_s, deceleration_output_rpm_s, {});
+  try {
+    impl_->enable_rpm(acceleration_output_rpm_s, deceleration_output_rpm_s);
+  } catch (...) {
+    try {
+      impl_->stop();
+    } catch (...) {
+    }
+    throw;
+  }
 }
 
 void IswvDrive::enable_rpm(

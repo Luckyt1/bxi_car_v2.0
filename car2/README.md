@@ -1,266 +1,112 @@
-# 底盘与机械臂控制
+# BXI 小车控制工程
 
-ROS 2 Humble / C++17，包名仍为 `chassis`。主程序保留原有 ROS 话题、参数、启动校准和故障停机流程。
+ROS 2 `chassis` 包，包含 BXI 板卡与 CAN 通信、ISWV 舵轮底盘、意优 EtherCAT 机械臂、运动学解算、遥控器和 App 接口。此目录可独立编译，包含离线测试与 OTA 制包工具；编译产物、日志和实机状态记录不随源码发布。
 
 ## 目录
 
-```text
-CMakeLists.txt            # 根目录统一构建入口
-start.sh                  # 日常启动菜单：意优设零、仅底盘、整机
-start_yiyou_jog.sh         # 意优点动 / 设置零位快捷入口
-start_chassis_only.sh      # 底盘手柄启动快捷入口
-start_chassis_arm.sh       # 整机手柄启动快捷入口
-src/
-  thirdparty/
-    bxi/                  # board.h/.cpp：BXI 板卡、CAN 收发、共享电机电源
-      vendor/             # 厂家头文件和静态库
-    motor/
-      bxi/                # communication.h/.cpp + motor.h/.cpp：MIT 电机
-      yiyou/              # communication.h/.cpp + motor.h/.cpp：EtherCAT 电机
-        detail/           # CiA402 辅助逻辑
-        vendor/soem/      # 原有 SOEM 源码
-      iswv/               # communication.h/.cpp + motor.h/.cpp：CANopen 电机
-        protocol/         # PDO、Axis、对象字典等协议内部实现
-    arm/                  # kinematics.h/.cpp：正逆解；control.h/.cpp：机械臂控制
-    chassis/              # control.h/.cpp：底盘控制；转向校准、限位和运动学
-  example/
-    main.cpp              # ROS 主入口，调用各模块
-    remote_control.h/.cpp # 手柄与 ROS 接口
-    arm_parameters.h      # 机械臂 ROS 参数适配
-  config/                 # 原有机械尺寸、电机方向和站位配置
-  cmake/                  # 安装包导出模板
-test/
-  debug.py               # 唯一面向使用者的调试菜单
-  tools/                 # 菜单调用的 C++ 后端和 Python 辅助模块
-  unit/                  # 离线回归与模拟通信测试
-docs/                    # 协议与机械臂说明
-```
+| 路径 | 用途 |
+| --- | --- |
+| `src/example/` | ROS 主程序、遥控器与断连保护 |
+| `src/thirdparty/` | 板卡、电机、机械臂、底盘模块及必要供应商依赖 |
+| `src/config/` | 底盘硬件、机械臂及运动学配置 |
+| `tools/` | 意优点动/设零工具、机械臂力矩报告 |
+| `test/` | 模拟通信回归、离线测试与数字调试菜单 |
+| `scripts/` | App 启动、配置迁移、安装检查与 OTA 制包 |
+| `start*.sh` | 日常启动入口 |
+| `deploy/` | systemd 部署示例 |
+| `docs/` | 控制接口、依赖来源和许可说明 |
 
-`src/thirdparty` 按本项目约定包含自有模块和外部依赖。`bxi/board` 与 `motor/bxi` 分别控制板卡和电机。通信层负责收发、编解码或总线会话，调用层提供电机操作；底盘调参在确认电机失能后由底盘层回调执行。
+## 编译
 
-## 构建与测试
+发布构建环境为 Ubuntu 22.04 x86_64、ROS 2 Humble、C++17、CMake 和 Python 3。依赖 `rclcpp`、`rcl_interfaces`、`rclpy`、`geometry_msgs`、`std_msgs`、`yaml_cpp_vendor` / yaml-cpp；力矩图表使用 Python matplotlib。所需 BXI PCI 静态库和 Linux SOEM 源码已随工程保留，构建时无需下载它们。
 
-在项目根目录直接执行 `colcon build`，产物使用标准的 `build/`、`install/`、`log/`。
-启动脚本、调试工具和整车服务都使用这里生成的程序。
+在已配置 ROS 2 和 rosdep 的环境中，从本目录执行：
 
 ```bash
 source /opt/ros/humble/setup.bash
-colcon build
-source install/setup.bash
-colcon test
+rosdep install --from-paths . --ignore-src -r -y
+colcon build --base-paths . --packages-select chassis --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon test --packages-select chassis
 colcon test-result --verbose
+source install/setup.bash
 ```
 
-工控机 `/home/bxi/tang/car2` 编译成功后，用
-`sudo systemctl restart ros_elf_launch.service` 加载新程序。只改 YAML 时无需编译。
-需要自定义构建目录时，仍可设置 `CHASSIS_BUILD_DIR` 和 `CHASSIS_INSTALL_DIR`。
-`src/cmake/` 中的 `.cmake.in` 是安装包导出模板，属于构建源码，需要保留。
-
-## 日常启动脚本
-
-参考 car2 的操作方式，在源码根目录执行：
+也可直接使用 CMake，测试只使用模拟通信、测试 ROS 节点或程序 `--help`，不会启动真实电机：
 
 ```bash
-sudo -E bash start.sh
+source /opt/ros/humble/setup.bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake --build build --parallel 4
+ctest --test-dir build --output-on-failure
 ```
 
-菜单选择 `1` 意优点动/设置零位、`2` 底盘单独启动、`3` 整机启动、`0` 退出。
-也可以直接使用与 car2 同名的快捷脚本：
+使用的 BXI PCI 设备及系统驱动需在目标机器上可用；本仓库只包含用户态接口和供应商静态库。更换 CPU 架构时需使用匹配架构的供应商库。
+
+## App 与 OTA
+
+现有 App 通过支持 `car2` 后端的 `bxi_rc_ros2` 网关启动本包。机器人上的
+`/etc/bxi/control_backend.env` 选择 `BXI_CONTROL_BACKEND=car2`；
+`BXI_CAR2_ENABLE_ARM=0` 仅启动底盘，`1` 启动底盘及机械臂。
+App 入口继承网关的 ROS domain/DDS 配置，收到启动操作后才初始化硬件和校准。
+App 与手柄主控不能同时占用设备；启用 App 管理后应停用旧手柄自启动服务。
+
+OTA 程序安装到 `/opt/bxi/car2`，每台机器的配置、标定和第四轴位置记忆保存在
+`/var/lib/bxi/car2`，升级保留已有内容。网关默认等待启动完成 900 秒；启动期间可在 App 停止。
+升级时控制程序必须停止，安装程序不会自动启动电机。
+
+仓库根目录的 GitHub Actions 工作流负责 `main` 分支的编译、离线测试和发布；
+`scripts/package_ota.py` 生成 `car2_vYYMMDD-N.tar.gz` 及同名 `.sha256` 文件，
+x86_64 发布目录为 BXI 下载站的 `/ELF3/car2`。
+其他机器人需要兼容硬件、ROS Humble 和已启用 `car2` 后端的网关，才能使用该升级项。
+具体接口与首次部署见 [App 接入说明](docs/app_integration.md) 和 [OTA 说明](docs/car2_ota.md)。
+
+## 转向校准反馈
+
+四轴校准循环读取驱动器持续上报的 TPDO1/2/3，分别检查状态/位置、电流和故障字段。
+配置完成后保持零目标，最多等待 250 ms 收齐新反馈；运动期间任一帧年龄达到 100 ms，
+或位置与电流帧接收时间相差超过 20 ms，均中止校准。
+故障、超速、力矩上限、硬限位间距和各阶段超时保护保留。
+主要校准阶段各有 230 秒上限，阶段切换后重新计时；这些软件检查不承诺固定的物理停机延迟。
+
+## 配置与启动
+
+先核对 `src/config/steering.yaml`、其引用的 `steering_hardware.yaml` 和 `yiyou_ethercat.yaml`。其中网口、站位、轴方向、几何尺寸和零位参数来自现有小车，应按目标机器配置。
+
+默认 EtherCAT 网口为 `enp86s0`，手柄为 `/dev/input/js0`。EtherCAT 网口需处于 UP 状态，进程需要访问 BXI 设备及原始网口的权限。手柄可用 `JOYSTICK_DEVICE` 覆盖。整机网口在机械臂 YAML 中设置，`YIYOU_CONFIG` 可指定该 YAML；`YIYOU_INTERFACE` 仅设置点动/设零工具的网口选择默认值。完整说明见 `bash start.sh --help`。
 
 ```bash
-# 意优前三轴点动、设置零位；按实际网口和站位修改。
-sudo -E bash start_yiyou_jog.sh --interface enp86s0 --slaves 1,2,3
-# 仅底盘：等待手柄启动键，不初始化机械臂。
+bash start.sh robot --dry-run  # 预览命令，不访问硬件
+sudo -E bash start.sh          # 菜单：设零、底盘、整机
 sudo -E bash start_chassis_only.sh
-# 整机：等待手柄启动键，按配置机械臂回零后校准底盘。
 sudo -E bash start_chassis_arm.sh
 ```
 
-意优界面中，左右键选轴，上下键每次点动 1°，`z` 将当前轴当前位置写成 EEPROM 零位，
-`q` 退出。只有按 `z` 才设零并保存该轴全部可持久化参数；记录写入项目根目录的
-`yiyou_ethercat_zero_calibration.json`。这与启动时返回已保存零位是两个操作。
-菜单默认使用网口 `enp86s0`、站位 `1,2,3`，可以用 `YIYOU_INTERFACE`、`YIYOU_SLAVES`
-修改；快捷脚本的 `--interface`、`--slaves` 参数优先。
+底盘/整机启动后，松开再按 `button14` 开始，`button11` 急停，`Ctrl-C` 退出。整机默认先让前三轴回到配置中的已保存零位，再校准底盘；启动不会重写 EEPROM 零点。第四轴保持实际启动位置。
 
-底盘和整机默认松开后按 **button14** 开始，**button11** 急停，`Ctrl-C` 退出。
-整机调用 `robot_control`，底盘调用 `chassis_only_remote`；其余控制参数沿用当前程序和
-`src/config` 的配置。可用 `CHASSIS_CONFIG`、`YIYOU_CONFIG` 覆盖配置文件，
-`JOYSTICK_DEVICE` 覆盖手柄设备，末尾追加 ROS 参数作临时覆盖：
+启动脚本依次查找 `build/chassis/`、`build/`、`install/chassis/lib/chassis/`、`install/lib/chassis/` 下的程序。自定义构建目录可设置 `CHASSIS_BUILD_DIR`、`CHASSIS_INSTALL_DIR`。移动源码目录后需重新编译，以更新程序内默认配置和状态文件路径。
+
+## 意优点动与第四轴位置记录
 
 ```bash
-sudo -E bash start_chassis_arm.sh --ros-args -p yiyou_arm_home_on_start:=false
-# 以下只预览命令，不加载 ROS 环境或启动设备，也不需要 sudo。
-bash start.sh --dry-run
-bash start_yiyou_jog.sh --dry-run
-bash start_chassis_only.sh --dry-run
-bash start_chassis_arm.sh --dry-run
+sudo -E bash start_yiyou_jog.sh --interface enp86s0 --slaves 4
 ```
 
-脚本可从任意工作目录调用，按项目根目录定位 `build/` 和 `install/`，支持
-`CHASSIS_BUILD_DIR` / `CHASSIS_INSTALL_DIR` 覆盖目录。
-底盘/整机脚本自动加载 ROS 环境；脚本不自动提权或启用网卡。
-运行前需有设备访问权限、EtherCAT 网口已启用，并避免多个程序同时控制同一设备。
-`--help` 查看脚本参数。日常启动脚本保留在源码根目录，调试菜单仍使用下面的入口。
+左右切换站位，上下每次点动 100° 输出轴角度，`z` 将所选轴的当前位置保存为 EEPROM 零点，`q` 退出。点动工具默认 20 RPM，可用 `--speed-rpm` 调整；它与遥控运行的速度配置独立。**只在已确认机械位置就是所需零位时按 `z`**，此操作也会保存该轴其他持久化参数。
 
-## 底盘日常调参
+第四轴遥控采用 PP 位置控制：`button0` / `button4` 正反移动，松手减速停止并保持；速度 12 RPM（72°/秒），加减速度 24 RPM/s，软件目标范围为累计输出角 0°～1200°。软件限位不能保证实际运动无超调；PP 出力由驱动器位置环及其原有电流/力矩限制决定。
 
-修改 `src/config/steering.yaml` 后重启程序生效，底盘和遥控器共同读取它。
+源码启动时，第四轴多圈角度默认保存在 `state/yiyou_motor4_position.yaml`；App 部署使用 `/var/lib/bxi/car2/state/yiyou_motor4_position.yaml`。该实机记录不随代码发布，新机器/新目录缺少可信记录时会禁止第四轴移动；应在已知机械零位通过上述工具显式设零，创建对应记录。调试工具与遥控程序必须共用同一记录；单机同时只运行一个控制程序。
 
-| 调节内容 | 参数 | 当前值 |
-| --- | --- | --- |
-| 四轮输出轴最高转速 | `drive_max_output_rpm` | 105 RPM |
-| 四轮轮缘加速度 / 减速度 | `drive_acceleration_m_s2` / `drive_deceleration_m_s2` | 2 / 2.4 m/s² |
-| 舵轮转向速度 / 整车 yaw 变化率 | `steering_rate_limit_rad_s` / `command_yaw_acceleration_rad_s2` | 4 rad/s / 0.8 rad/s² |
-| 整车 x / y / yaw 速度上限 | `max_velocity_x_m_s` / `max_velocity_y_m_s` / `max_velocity_yaw_rad_s` | 0 / 0 / 0 |
-| 遥控满杆 x / y / yaw 速度 | `scale_linear` / `scale_lateral` / `scale_angular` | 0.6 m/s / 0.6 m/s / 0.4 rad/s |
-| 遥控 x/y 正向 / 负向指令变化率 | `max_accel` / `max_decel` | 1.2 / 2.4 m/s² |
+恢复累计角度要求断电期间轴没有移动，且运动均由本工程的受控入口执行。记录丢失、损坏、身份不符或无法唯一恢复位置时程序拒绝运动。不要通过复制其他机器记录或删除记录来解除保护。详细接口与边界见 [机械臂控制说明](docs/arm_cartesian_control.md)。
 
-整车上限为 `0` 时保留原有轮速限制；设为正数后，超限指令的 x/y/yaw 同比例缩小。
-这些上限适用于 `/cmd_vel_car`、遥控器和控制器直接调用，自动前进也受 x 上限约束。
-遥控变化率沿用原算法，按指令差值正负选择，不按车速绝对值的加速/减速分类。
-原配置中的逐轮设置实际将轮速限制为 105 RPM；整理后直接显示该有效值。
+## 日志与部署
 
-`hardware_config_file` 指向同目录的 `steering_hardware.yaml`，保存 CAN、机械尺寸、
-方向、校准和驱动器参数。驱动器 `null` 参数的自动回填留在所属文件，日常文件不会
-因此展开。日常文件同名参数优先；旧单文件 YAML 和显式逐轮 `modules` 仍可加载，
-旧配置的逐轮字段仍优先于全局字段。复制配置时同时复制这两个文件。
-通过无节点限定的 `-p steering_config_file:=/path/steering.yaml` 同时选择底盘和遥控配置；
-遥控的显式 ROS 参数（例如 `-p scale_linear:=0.3`）优先于 YAML 中的默认值。
+CAN 诊断写入 `log/can/`，机械臂力矩数据和图表写入 `log/arm_torque/`。`tools/arm_torque_report.py` 是运行日志的出图工具，已保留。
 
-## 统一调试入口
+`deploy/ros_elf_launch.service` 是可选自启动示例，使用 `/opt/bxi_car/car2`、`enp86s0` 和 `/dev/input/js0`；安装前应修改为实际部署路径和设备。默认启动后等待手柄启动键。源码复制本身不会安装或启用服务。
 
-```bash
-python3 test/debug.py
-# 安装后也可以：
-ros2 run chassis debug.py
-```
+`.gitignore` 排除构建目录、日志、多圈位置状态、零位标定 JSON、缓存和本地开发配置。
 
-- `1` 电机调试，再选择 `1 BXI / 2 意优 / 3 ISWV`。
-- `2` 机械臂离线正逆解，使用 `src/config/arm_kinematics.json`，不连接电机。
-- `3` 底盘调试，选择直接启动或遥控启动。
-- `0` 退出。
+## 依赖与许可
 
-预览菜单将运行的命令：
-
-```bash
-python3 test/debug.py --dry-run
-python3 test/debug.py --mode yiyou --interface enp86s0 --slaves 1,2,3 --dry-run
-python3 test/debug.py --mode iswv --bus 1 --node 1 --dry-run
-python3 test/debug.py --mode arm
-```
-
-电机、底盘模式会实际打开设备；`--dry-run` 和 `--help` 不打开设备。意优网口通过 `--interface` 指定，站位通过 `--slaves` 指定。调试工具默认机械参数需与实机一致，使用 `--help` 查看接口单位与可选项。不要同时启动多个控制同一设备的程序。
-
-## 主控制程序
-
-只有一份 `src/example/main.cpp`，保留原来的可执行名称供现有 ROS 调用继续使用：
-
-`main()` 负责模式选择、ROS 初始化和程序退出；`run_control()` 管理遥控等待和节点调度。
-节点内部按 `read_startup_config()`、`initialize_hardware()`、`setup_ros_interfaces()` 顺序启动，
-运行期间由 `update_control()` 统一处理机械臂、底盘和反馈。
-
-| 程序 | 启动方式 |
-| --- | --- |
-| `chassis` | 底盘与机械臂直接启动 |
-| `key_control` / `robot_control` | 等待手柄启动键，再启动底盘与机械臂 |
-| `chassis_only` | 只启动底盘 |
-| `chassis_only_remote` | 手柄启动，只控制底盘 |
-
-```bash
-source /opt/ros/humble/setup.bash
-source install/setup.bash
-ros2 run chassis robot_control
-```
-
-程序默认读取本项目 `src/config/steering.yaml`；含机械臂的模式还会读取
-`src/config/yiyou_ethercat.yaml`。查找不依赖终端当前目录，在本项目中修改配置后重启程序即可生效。
-源码配置目录不存在时，使用可执行程序所在安装前缀的 `share/chassis/config/`。
-手柄模式仍等待 14 号启动键，再按配置进行机械臂回零和底盘校准。
-
-临时使用其他配置或参数时，仍可覆盖默认值：
-
-```bash
-ros2 run chassis robot_control --ros-args \
-  -p steering_config_file:=/absolute/path/steering.yaml \
-  --params-file /absolute/path/yiyou_ethercat.yaml \
-  -p yiyou_arm_home_on_start:=false
-```
-
-底盘接收 `/cmd_vel_car`；机械臂使用 `yiyou_arm_target=[x,z,pitch]` 和 `/arm_pose`。
-底盘默认在 300 ms 没有新速度指令后下发零速，每 20 ms 控制周期检查一次。
-可在启动参数中用 `-p chassis:command_timeout_sec:=0.3` 设置正数超时值；不要用单次非零消息保持行驶。
-
-Battle Dragon 蓝牙手柄（20d6:400d）的链路保护每 100 ms 主动读取一次 HID 输入报告，
-500 ms 没有成功应答即禁止运动，在下一个 50 ms 遥控周期持续发布零速度。
-查询在独立线程执行，蓝牙读操作卡住不会阻塞遥控停车；摇杆保持不动不要求产生新事件。
-断连、设备拔除、读取失败或权限不足均停止输出；恢复后重新读取轴状态，必须先回中再操作。
-目前主动探测只验证过该型号的蓝牙连接：其他设备或 USB 接收器连接会保持零速并记录原因，
-需先验证对应接收器的无线连接检测协议才能开放控制。服务以 root 运行可读取 hidraw；
-手动运行时也需有对应 hidraw 设备的读取权限。
-
-以上时间是零速度指令的检测/下发时限，实际停车还需要驱动器减速时间。
-两层保护依赖控制进程正常调度，不能替代硬件急停。机械臂方向配置保持原值。
-
-## 模块调用示例
-
-各模块的 `example.cpp` 提供可复制的调用片段，顶部注明对象创建和通信前提。
-ISWV 与意优示例直接调用 motor 的使能、目标设置和停止方法；单位写在对应调用旁，
-失败时尝试停车并保留原始异常。意优的位置、电流调用列在同一文件中，按需选用。
-BXI 电机示例是可编辑的 `main()` 框架；三种电机示例均不加入默认编译。
-
-可用 `cmake --build build/chassis --target iswv_motor_example yiyou_motor_example bxi_motor_example`
-检查这些示例的编译；这条命令不会运行电机，编辑器也会使用对应的头文件路径。
-
-| 模块 | 示例 | 展示内容 |
-| --- | --- | --- |
-| BXI 板卡 | [bxi/example.cpp](src/thirdparty/bxi/example.cpp) | 打开通道、共享电源、发帧、接收回调 |
-| BXI 电机 | [motor/bxi/example.cpp](src/thirdparty/motor/bxi/example.cpp) | MIT 使能、位置/速度/力矩调用、退出模式 |
-| ISWV 电机 | [motor/iswv/example.cpp](src/thirdparty/motor/iswv/example.cpp) | 速度模式初始化、速度目标、反馈、停止 |
-| 意优电机 | [motor/yiyou/example.cpp](src/thirdparty/motor/yiyou/example.cpp) | 速度、位置、电流模式及反馈、停止 |
-| 机械臂运动学 | [arm/example.cpp](src/thirdparty/arm/example.cpp) | 正解、逆解、结果状态与单位 |
-| 底盘 | [chassis/example.cpp](src/thirdparty/chassis/example.cpp) | 舵轮解算、配置、启动、速度目标、周期更新、停车 |
-
-电机和通信对象由调用方长期持有，初始化与周期目标更新分开。
-各文件顶部注明所需链接库；错误处理保留原接口的 Result 或异常语义。
-机械臂示例只依赖 chassis_arm_kinematics。
-
-| 头文件 | 调用方式与单位 |
-| --- | --- |
-| `bxi/board.h` | `chassis::BxiPciTransport(bus)`；`set_motor_power(true/false)` |
-| `motor/bxi/motor.h` | `bxi::Motor`：`set_position()`、`set_velocity()`、`set_torque()` 均须显式传入 `bxi::Model`；MIT 参数为 rad、rad/s、Nm 和 Kp/Kd |
-| `motor/iswv/bxi_transport.h` | `iswv::BxiTransport(board)`：将 BXI 板卡接入 ISWV CANopen 主站 |
-| `motor/yiyou/motor.h` | `chassis::YiyouMotor`：`enable_rpm()`、`enable_position()`、`enable_cst()`、目标输入、`stop()`；分别为输出轴 RPM、编码器脉冲、额定电流千分比 |
-| `motor/iswv/motor.h` | `chassis::IswvDrive`：`enable_rpm()`、`set_velocity_rpm()`、`stop()`；转向位置和其他支持的模式复用 `iswv::Axis` / `axis.drive()` |
-
-BXI 的接口提供 MIT 模式，不虚构 CANopen 式模式切换；ISWV 与意优保留各自协议支持的模式。`stop()` 在意优和 ISWV 中包含停车及失能。构造板卡/主站、上电、校准和退出顺序由应用管理，正逆解可以独立使用 `arm::Kinematics`。
-
-安装后 CMake 使用 `find_package(chassis REQUIRED)`，链接例如 `chassis::chassis_bxi_motor`、`chassis::chassis_arm_kinematics`；CANopen 仍导出 `iswv::canopen`。供应商来源与许可范围见 [docs/dependencies.md](docs/dependencies.md)。
-
-BXI 板卡和电机使用自己的 `bxi::Result`、`bxi::CanFrame` 和 `bxi::ICanTransport`，
-其源码及两个库均不依赖 ISWV。ISWV 保留自己的同类接口；使用 BXI 板卡驱动 ISWV 电机时，
-额外链接 `chassis::chassis_iswv_bxi_transport`，并将
-`std::make_shared<iswv::BxiTransport>(board)` 传给 `iswv::canopen::CanopenMaster`。
-这个适配器负责类型转换，并与主站一起持有板卡；共享电源仍通过 `board->set_motor_power()` 管理。
-
-## 作为示例工程移植
-
-本项目可作为板卡、电机、机械臂或底盘模块的移植参考。仓库内提供
-[port-robot-modules Skill](skills/port-robot-modules/SKILL.md)，包含模块依赖、通信与调用层边界、配置迁移和离线验证方法。
-Skill 不打包驱动源码，使用时需要能访问本项目；可以只提取所需模块，不必复制整个工程。
-
-将 `skills/port-robot-modules` 整个目录放到 Codex 的技能目录
-`${CODEX_HOME:-$HOME/.codex}/skills/` 后，在目标项目的新会话中使用，例如：
-
-```text
-使用 $port-robot-modules，参考 /path/to/car2.1，
-把机械臂正逆解移植到当前项目，使用 C++17，不使用 ROS 2。
-```
-
-```text
-使用 $port-robot-modules，参考 /path/to/car2.1，
-把 ISWV 电机模块和 BXI 板卡接入当前 ROS 2 项目，
-分开通信层与调用层，提供调用示例并完成离线构建验证。
-```
-
-完整 ROS 控制可以复用应用层；纯 C++ 移植需要给选定模块单独接入 CMake，
-因为参考工程根 CMake 仍依赖 ROS/ament。新设备的网卡、ID、方向、零偏、限位和启动回零须另行配置；移植验证默认不操作硬件。
+本项目许可见 [LICENSE](LICENSE)。第三方组件沿用各自许可和来源说明，供应商静态库是必需依赖。详见 [依赖来源](docs/dependencies.md) 和 [机械臂解算来源](docs/arm_kinematics_origin.md)。

@@ -1,12 +1,16 @@
 #include "motor/iswv/communication.h"
+#include "motor/iswv/diagnostic_log.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <iomanip>
+#include <iostream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -74,6 +78,7 @@ struct SdoTransaction
   SdoKind kind{SdoKind::upload};
   CanFrame request;
   std::chrono::milliseconds timeout{250};
+  std::chrono::steady_clock::time_point started{};
   std::chrono::steady_clock::time_point deadline{};
   bool active{false};
   std::atomic<bool> completed{false};
@@ -134,6 +139,14 @@ public:
       options_.timer_resolution.count() <= 0)
     {
       throw std::invalid_argument("CANopen master queue sizes and timer must be positive");
+    }
+    if (!options_.diagnostic_log_directory.empty()) {
+      try {
+        diagnostics_ = std::make_unique<DiagnosticLog>(
+          options_.diagnostic_log_directory, transport_->name());
+      } catch (const std::exception & error) {
+        std::cerr << "CAN diagnostics unavailable: " << error.what() << '\n';
+      }
     }
   }
 
@@ -243,16 +256,25 @@ public:
         ErrorCode::transport_closed,
         "CANopen master is stopped");
     }
+    diagnostic_frame("CAN_TX_ATTEMPT", frame);
     try {
       auto result = transport_->send(frame);
       if (result) {
-        std::lock_guard<std::mutex> lock(statistics_mutex_);
-        ++statistics_.transmitted_frames;
+        {
+          std::lock_guard<std::mutex> lock(statistics_mutex_);
+          ++statistics_.transmitted_frames;
+        }
+        // A successful transport call only acknowledges the host-side enqueue.
+        diagnostic_frame("CAN_TX_QUEUED", frame);
+      } else {
+        diagnostic_failure("CAN_TX_FAILED", result.error().message);
       }
       return result;
     } catch (const std::exception & error) {
+      diagnostic_failure("CAN_TX_FAILED", error.what());
       return Result<void>::failure(ErrorCode::transport_error, error.what());
     } catch (...) {
+      diagnostic_failure("CAN_TX_FAILED", "unknown transport exception");
       return Result<void>::failure(
         ErrorCode::transport_error,
         "transport send threw an unknown exception");
@@ -616,6 +638,8 @@ private:
     if (frame.received_at == std::chrono::steady_clock::time_point{}) {
       frame.received_at = std::chrono::steady_clock::now();
     }
+    // Record before the protocol queue so queue loss/delay can be distinguished.
+    diagnostic_frame("CAN_RX", frame);
     {
       std::lock_guard<std::mutex> lock(receive_mutex_);
       if (receive_queue_.size() >= options_.receive_queue_limit) {
@@ -630,6 +654,7 @@ private:
 
   void transport_error(Error error)
   {
+    diagnostic_failure("CAN_TRANSPORT_ERROR", error.message);
     std::vector<std::function<void(const Error &)>> callbacks;
     {
       std::lock_guard<std::mutex> lock(callbacks_mutex_);
@@ -743,6 +768,7 @@ private:
       return;
     }
     if (frame.fd || frame.error) {
+      if (frame.error) {diagnostic_failure("CAN_ERROR_FRAME", "controller error frame");}
       // CANopen uses classic data/remote frames. Preserve other valid bus
       // traffic for raw observers without feeding it into the protocol.
       emit_raw(frame);
@@ -787,6 +813,7 @@ private:
 
   bool process_sdo(const CanFrame & frame)
   {
+    diagnostic_frame("SDO_RX_DISPATCH", frame);
     if (frame.size != 8) {
       return false;
     }
@@ -798,6 +825,7 @@ private:
       if (it == sdo_queues_.end() || it->second.empty() ||
         !it->second.front()->active)
       {
+        diagnostic_frame("SDO_UNMATCHED", frame);
         return false;
       }
       transaction = it->second.front();
@@ -808,6 +836,7 @@ private:
       (static_cast<std::uint16_t>(frame.data[2]) << 8U)),
       frame.data[3]};
     if (object != transaction->object) {
+      diagnostic_frame("SDO_UNMATCHED", frame);
       return false;
     }
 
@@ -1041,9 +1070,11 @@ private:
         }
         transaction = it->second.front();
         transaction->active = true;
-        transaction->deadline = std::chrono::steady_clock::now() +
+        transaction->started = std::chrono::steady_clock::now();
+        transaction->deadline = transaction->started +
           transaction->timeout;
       }
+      diagnostic_sdo("SDO_BEGIN", *transaction);
       receive_cv_.notify_one();
       auto sent = send_frame(transaction->request);
       if (sent) {
@@ -1078,6 +1109,16 @@ private:
     bool expected = false;
     if (!transaction->completed.compare_exchange_strong(expected, true)) {
       return;
+    }
+    if (result) {
+      diagnostic_sdo("SDO_OK", *transaction);
+    } else {
+      const bool timeout = result.error().code == ErrorCode::timeout;
+      diagnostic_sdo(timeout ? "SDO_TIMEOUT" : "SDO_FAIL", *transaction,
+        result.error().message);
+      if (result.error().code != ErrorCode::cancelled) {
+        diagnostic_failure(timeout ? "SDO_TIMEOUT" : "SDO_FAIL", result.error().message);
+      }
     }
     enqueue_event(
       true,
@@ -1226,8 +1267,75 @@ private:
     }
   }
 
+  void diagnostic_frame(const char * event, const CanFrame & frame) noexcept
+  {
+    if (!diagnostics_) {return;}
+    try {
+      std::ostringstream line;
+      line << event << " id=0x" << std::hex << std::setfill('0') << std::setw(3)
+           << frame.id << std::dec << " dlc=" << static_cast<unsigned>(frame.size)
+           << " extended=" << frame.extended << " fd=" << frame.fd
+           << " rtr=" << frame.remote << " error=" << frame.error;
+      if (frame.received_at != std::chrono::steady_clock::time_point{}) {
+        line << " rx_age_us=" << std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - frame.received_at).count();
+      }
+      line << " data=";
+      for (std::size_t i = 0; i < std::min<std::size_t>(frame.size, frame.data.size()); ++i) {
+        line << std::hex << std::setw(2) << static_cast<unsigned>(frame.data[i]) << ' ';
+      }
+      diagnostics_->record(line.str());
+    } catch (...) {
+      // Diagnostics must not change communication or the safety stop path.
+    }
+  }
+
+  void diagnostic_sdo(
+    const char * event, const SdoTransaction & transaction,
+    const std::string & error = {}) noexcept
+  {
+    if (!diagnostics_) {return;}
+    try {
+      const auto elapsed = transaction.started == std::chrono::steady_clock::time_point{} ?
+        0.0 : std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - transaction.started).count();
+      std::ostringstream line;
+      line << event << " seq=" << transaction.sequence
+           << " node=" << static_cast<unsigned>(transaction.node_id)
+           << " object=" << object_name(transaction.object)
+           << " operation=" << (transaction.kind == SdoKind::upload ? "read" : "write")
+           << " timeout_ms=" << transaction.timeout.count()
+           << " elapsed_ms=" << std::fixed << std::setprecision(3) << elapsed;
+      if (!error.empty()) {line << " error=" << error;}
+      diagnostics_->record(line.str());
+    } catch (...) {
+    }
+  }
+
+  void diagnostic_failure(const char * event, const std::string & reason) noexcept
+  {
+    if (!diagnostics_) {return;}
+    try {
+      const auto stats = statistics();
+      std::ostringstream line;
+      line << event << " reason=" << reason
+           << " tx_queued=" << stats.transmitted_frames
+           << " rx_processed=" << stats.received_frames
+           << " invalid_frames=" << stats.invalid_frames
+           << " receive_queue_drops=" << stats.receive_queue_drops
+           << " event_queue_drops=" << stats.event_queue_drops
+           << " sdo_timeouts=" << stats.sdo_timeouts
+           << " sdo_aborts=" << stats.sdo_aborts
+           << " heartbeat_frames=" << stats.heartbeat_frames
+           << " emergency_frames=" << stats.emergency_frames;
+      diagnostics_->trigger(line.str());
+    } catch (...) {
+    }
+  }
+
   std::shared_ptr<ICanTransport> transport_;
   MasterOptions options_;
+  std::unique_ptr<DiagnosticLog> diagnostics_;
   std::atomic<bool> stopping_{false};
   std::thread protocol_thread_;
   std::thread event_thread_;
