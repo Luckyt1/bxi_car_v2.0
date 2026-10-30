@@ -15,10 +15,35 @@ from urllib import error, parse, request
 
 UPLOAD_TASK_TIMEOUT = 15 * 60
 UPLOAD_POLL_INTERVAL = 3
+RETRY_DELAYS = (1, 2, 4)
+RETRYABLE_API_REQUESTS = {
+    ('POST', '/api/auth/login'),
+    ('GET', '/api/me'),
+    ('POST', '/api/fs/mkdir'),
+    ('POST', '/api/fs/list'),
+    ('POST', '/api/fs/get'),
+    ('POST', '/api/task/upload/info'),
+}
 
 
 class PublishError(RuntimeError):
     pass
+
+
+def retry_transport_error(exc, attempt, deadline=None):
+    if (isinstance(exc, error.HTTPError) and
+            exc.code != 429 and not 500 <= exc.code < 600):
+        return False
+    if attempt >= len(RETRY_DELAYS):
+        return False
+    delay = RETRY_DELAYS[attempt]
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise PublishError('OpenList upload task timed out') from None
+        delay = min(delay, remaining)
+    time.sleep(delay)
+    return True
 
 
 class NoRedirect(request.HTTPRedirectHandler):
@@ -79,7 +104,7 @@ class OpenList:
             raise PublishError('OpenList and download URLs must use HTTPS without credentials') from None
 
     def api(self, method, endpoint, payload=None, *, authenticated=True, body=None,
-            headers=None, timeout=300):
+            headers=None, timeout=300, deadline=None):
         outgoing = dict(headers or {})
         if authenticated:
             if not self.token:
@@ -92,17 +117,33 @@ class OpenList:
         # Query values can originate in the response (for example a task ID).
         # Include only the fixed API path in diagnostics, never those values.
         endpoint_name = endpoint.partition('?')[0]
-        try:
-            with self.api_opener.open(req, timeout=timeout) as response:
-                encoded = response.read(2 * 1024 * 1024 + 1)
-            if len(encoded) > 2 * 1024 * 1024:
-                raise PublishError('OpenList API response exceeded the size limit')
-            result = json.loads(encoded)
-        except error.HTTPError as exc:
-            raise PublishError(f'OpenList {endpoint_name} failed (HTTP {exc.code})') from None
-        except (OSError, error.URLError, http.client.HTTPException, ValueError):
-            # Remote error bodies and signed URLs can contain credentials.
-            raise PublishError(f'OpenList {endpoint_name} failed or returned invalid JSON') from None
+        retryable = (method, endpoint_name) in RETRYABLE_API_REQUESTS
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            request_timeout = timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise PublishError('OpenList upload task timed out')
+                request_timeout = min(timeout, remaining)
+            try:
+                with self.api_opener.open(req, timeout=request_timeout) as response:
+                    encoded = response.read(2 * 1024 * 1024 + 1)
+                if len(encoded) > 2 * 1024 * 1024:
+                    raise PublishError('OpenList API response exceeded the size limit')
+                result = json.loads(encoded)
+                break
+            except (OSError, error.URLError, http.client.HTTPException) as exc:
+                if isinstance(exc, error.HTTPError):
+                    exc.close()
+                if retryable and retry_transport_error(exc, attempt, deadline):
+                    continue
+                # Remote error bodies, query values and signed URLs can contain
+                # credentials. Report only a fixed path and numeric HTTP code.
+                if isinstance(exc, error.HTTPError):
+                    raise PublishError(f'OpenList {endpoint_name} failed (HTTP {exc.code})') from None
+                raise PublishError(f'OpenList {endpoint_name} failed or returned invalid JSON') from None
+            except ValueError:
+                raise PublishError(f'OpenList {endpoint_name} returned invalid JSON') from None
         if not isinstance(result, dict) or result.get('code') != 200:
             code = result.get('code') if isinstance(result, dict) else None
             code = code if isinstance(code, int) else 'invalid'
@@ -173,7 +214,7 @@ class OpenList:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise PublishError('OpenList upload task timed out')
-            task = self.api('POST', endpoint, timeout=min(60, remaining))
+            task = self.api('POST', endpoint, timeout=60, deadline=deadline)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise PublishError('OpenList upload task timed out')
@@ -200,21 +241,28 @@ class OpenList:
             raise PublishError(f'Public file size mismatch: {file.name}')
         url = metadata.get('raw_url')
         self.validate_url(url)
-        actual_hash = hashlib.sha256()
-        received = 0
-        try:
-            # A separate opener and a fresh request prevent Authorization from
-            # reaching a storage provider or its redirect/CDN destination.
-            with self.download_opener.open(request.Request(url), timeout=300) as response:
-                while block := response.read(1024 * 1024):
-                    received += len(block)
-                    if received > expected_size:
-                        raise PublishError(f'Public file size mismatch: {file.name}')
-                    actual_hash.update(block)
-        except (OSError, error.URLError, http.client.HTTPException):
-            raise PublishError(f'Public download verification failed: {file.name}') from None
-        if received != expected_size or actual_hash.hexdigest() != digest:
-            raise PublishError(f'Public file content mismatch: {file.name}')
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            # A retry starts the entire readback again, with a fresh digest.
+            actual_hash = hashlib.sha256()
+            received = 0
+            try:
+                # A separate opener and a fresh request prevent Authorization
+                # from reaching a storage provider or its redirect destination.
+                with self.download_opener.open(request.Request(url), timeout=300) as response:
+                    while block := response.read(1024 * 1024):
+                        received += len(block)
+                        if received > expected_size:
+                            raise PublishError(f'Public file size mismatch: {file.name}')
+                        actual_hash.update(block)
+            except (OSError, error.URLError, http.client.HTTPException) as exc:
+                if isinstance(exc, error.HTTPError):
+                    exc.close()
+                if retry_transport_error(exc, attempt):
+                    continue
+                raise PublishError(f'Public download verification failed: {file.name}') from None
+            if received != expected_size or actual_hash.hexdigest() != digest:
+                raise PublishError(f'Public file content mismatch: {file.name}')
+            return
 
 
 def publish(client, archive, checksum, public_directory):

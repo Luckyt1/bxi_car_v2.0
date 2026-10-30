@@ -25,6 +25,7 @@ class Site:
         self.base_path = self.public_directory
         self.files = {}
         self.events = []
+        self.http_errors = {}
         self.fail_upload = False
         self.upload_http_code = 200
         self.omit_task_id = False
@@ -56,11 +57,26 @@ class Site:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def fail_if_requested(self):
+                failures = site.http_errors.get((self.command, urlsplit(self.path).path), [])
+                if not failures:
+                    return False
+                code = failures.pop(0)
+                if code is None:
+                    # Close without a response to exercise an actual transport
+                    # failure, rather than mocking the HTTP client.
+                    self.close_connection = True
+                else:
+                    self.respond({'message': site.token + site.password}, code)
+                return True
+
             def do_POST(self):
                 body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
                 payload = json.loads(body) if body else {}
                 site.events.append(('POST', self.path, payload.get('path'),
                                     bool(self.headers.get('Authorization'))))
+                if self.fail_if_requested():
+                    return
                 if site.redirect_api:
                     self.send_response(307)
                     self.send_header('Location', site.redirect_api)
@@ -138,6 +154,8 @@ class Site:
             def do_GET(self):
                 site.events.append(('GET', self.path, None,
                                     bool(self.headers.get('Authorization'))))
+                if self.fail_if_requested():
+                    return
                 if self.path.startswith('/api/') and site.redirect_api:
                     self.send_response(307)
                     self.send_header('Location', site.redirect_api)
@@ -200,6 +218,10 @@ class Site:
 
 class PublisherTests(unittest.TestCase):
     def setUp(self):
+        # Keep retry backoff observable without slowing the HTTP test suite.
+        sleep_patch = patch('publish_ota.time.sleep')
+        self.sleep = sleep_patch.start()
+        self.addCleanup(sleep_patch.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.archive = Path(self.directory.name) / 'car2_v261030-1001.tar.gz'
@@ -274,6 +296,87 @@ class PublisherTests(unittest.TestCase):
         self.assertNotIn(self.site.password, str(caught.exception))
         self.assertNotIn(self.site.token, str(caught.exception))
         self.assertEqual(self.uploads(), [])
+        self.assertEqual(sum(e[1] == '/api/auth/login' for e in self.site.events), 2)
+        self.sleep.assert_not_called()
+
+    def test_safe_api_operations_recover_from_transient_http_and_transport_errors(self):
+        operations = [('POST', '/api/auth/login'), ('GET', '/api/me'),
+                      ('POST', '/api/fs/mkdir'), ('POST', '/api/fs/list'),
+                      ('POST', '/api/fs/get'), ('POST', '/api/task/upload/info')]
+        self.site.base_path = '/'
+        self.site.http_errors = {operation: [429, 525, None] for operation in operations}
+        self.client.login('publisher', self.site.password)
+        self.run_publish()
+        self.assertTrue(all(not remaining for remaining in self.site.http_errors.values()))
+        self.assertEqual(len(self.uploads()), 2)
+        self.assertIn(self.checksum.name, self.site.files)
+
+    def test_persistent_api_gateway_failure_is_bounded_and_redacts_secrets(self):
+        self.site.http_errors[('GET', '/api/me')] = [525] * 8
+        with self.assertRaisesRegex(PublishError, 'HTTP 525') as caught:
+            self.run_publish()
+        self.assertEqual(sum(e[1] == '/api/me' for e in self.site.events), 4)
+        self.assertEqual([call.args[0] for call in self.sleep.call_args_list], [1, 2, 4])
+        self.assertNotIn(self.site.token, str(caught.exception))
+        self.assertNotIn(self.site.password, str(caught.exception))
+        self.assertEqual(self.uploads(), [])
+
+    def test_http_authentication_denial_is_not_retried(self):
+        self.site.http_errors[('GET', '/api/me')] = [401] * 8
+        with self.assertRaisesRegex(PublishError, 'HTTP 401'):
+            self.run_publish()
+        self.assertEqual(sum(e[1] == '/api/me' for e in self.site.events), 1)
+        self.sleep.assert_not_called()
+
+    def test_anonymous_download_recovers_from_gateway_and_transport_errors(self):
+        download_path = '/download/' + self.archive.name
+        self.site.http_errors[('GET', download_path)] = [525, None]
+        self.run_publish()
+        downloads = [e for e in self.site.events if e[1] == download_path]
+        self.assertEqual(len(downloads), 3)
+        self.assertTrue(all(not event[3] for event in downloads))
+        self.assertIn(self.checksum.name, self.site.files)
+
+    def test_persistent_download_failure_is_bounded_and_blocks_checksum(self):
+        download_path = '/download/' + self.archive.name
+        self.site.http_errors[('GET', download_path)] = [525] * 8
+        with self.assertRaisesRegex(PublishError, 'Public download verification failed') as caught:
+            self.run_publish()
+        self.assertEqual(sum(e[1] == download_path for e in self.site.events), 4)
+        self.assertNotIn(self.site.token, str(caught.exception))
+        self.assertNotIn(self.site.password, str(caught.exception))
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_download_authorization_failure_is_not_retried(self):
+        download_path = '/download/' + self.archive.name
+        self.site.http_errors[('GET', download_path)] = [403] * 8
+        with self.assertRaisesRegex(PublishError, 'Public download verification failed'):
+            self.run_publish()
+        self.assertEqual(sum(e[1] == download_path for e in self.site.events), 1)
+        self.sleep.assert_not_called()
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_task_query_backoff_cannot_extend_upload_deadline(self):
+        task_path = '/api/task/upload/info'
+        self.site.http_errors[('POST', task_path)] = [525] * 8
+        with patch('publish_ota.time') as clock:
+            # Deadline creation, outer check, request check, retry backoff,
+            # and the next attempt's deadline check.
+            clock.monotonic.side_effect = [0, 0, 0, 899.5, 900]
+            with self.assertRaisesRegex(PublishError, 'timed out'):
+                self.run_publish()
+            clock.sleep.assert_called_once_with(0.5)
+        self.assertEqual(sum(e[1].startswith(task_path) for e in self.site.events), 1)
+        self.assertEqual(self.uploads(), ['/' + self.archive.name])
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_public_size_mismatch_is_not_retried(self):
+        self.site.files[self.archive.name] = b'wrong-size'
+        with self.assertRaisesRegex(PublishError, 'Public file size mismatch'):
+            self.run_publish()
+        self.assertEqual(sum(e[1] == '/api/fs/get' for e in self.site.events), 1)
+        self.sleep.assert_not_called()
+        self.assertEqual(self.uploads(), [])
 
     def test_upload_failure_does_not_publish_checksum_or_leak_token(self):
         self.site.fail_upload = True
@@ -339,6 +442,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.uploads(), ['/' + self.archive.name])
         self.assertNotIn(self.checksum.name, self.site.files)
         self.assertNotIn(self.site.token, str(caught.exception))
+        self.sleep.assert_not_called()
 
     def test_task_api_failure_does_not_expose_untrusted_query_or_body(self):
         self.site.task_id_prefix = self.site.token + ' & ' + self.site.password
@@ -356,6 +460,9 @@ class PublisherTests(unittest.TestCase):
             self.run_publish()
         self.assertEqual(self.uploads(), ['/' + self.archive.name])
         self.assertNotIn(self.checksum.name, self.site.files)
+        self.assertEqual(sum(e[1] == '/download/' + self.archive.name
+                             for e in self.site.events), 1)
+        self.sleep.assert_not_called()
 
     def test_private_downloads_prevent_publication(self):
         self.site.private_downloads = True
@@ -391,6 +498,8 @@ class PublisherTests(unittest.TestCase):
         with self.assertRaisesRegex(PublishError, 'code 403'):
             self.run_publish()
         self.assertEqual(self.uploads(), [])
+        self.assertEqual(sum(e[1] == '/api/fs/list' for e in self.site.events), 1)
+        self.sleep.assert_not_called()
 
     def test_bad_local_checksum_prevents_all_remote_writes(self):
         self.checksum.write_text('incorrect checksum')
