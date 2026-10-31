@@ -1,7 +1,8 @@
 # GitHub 自动发布 car2 OTA
 
 `main` 的 push 自动执行 `.github/workflows/ota.yml`：在 Ubuntu 22.04 / ROS Humble
-容器里编译 x86_64 程序、运行离线测试、安装到独立前缀、生成安装包，然后发布到
+容器里编译 x86_64 程序、运行离线测试、安装到独立前缀、生成安装包，然后通过 GitHub
+Releases 提供公开文件源，由下载站后台拉取到
 `https://download.bxirobotics.cn/ELF3/bxi_arm_car2/`。Pull request 也构建、测试和制包，但不会
 读取发布凭据或上传到下载站。可在 Actions 页面选择 main 手动运行。
 
@@ -17,13 +18,20 @@ OpenCV 和 NumPy 时启用，云端默认跳过这些可选测试。
 不会根据新的 attempt 改名。相同版本和内容的重传是幂等的。
 
 发布在同一 main 工作流内串行执行。上传前再次检查 main HEAD，已经被新提交取代的
-旧任务只保留 Actions artifact，不发布旧代码。仓库只需要 `contents: read` 权限，
-安装包和测试失败日志保留 30 天。
+旧任务只保留 Actions artifact，不发布旧代码。构建 job 使用 `contents: read`；仅 main
+的发布 job 使用 `contents: write` 创建版本标签及 Release 资产。Actions 安装包和测试
+失败日志保留 30 天，公开 Release 资产保持可下载。
+
+GitHub Release 先以草稿建立，安装包和校验文件齐备后才公开。版本绑定原构建提交；
+重跑会恢复草稿，现有同名资产必须逐字节一致，缺失的才补传，不使用 `--clobber`。
+网站接收的源地址为公开 Release 文件直链，不携带 GitHub token。
 
 ## 一次性站点和仓库配置
 
 1. 站点管理员创建 `/ELF3/bxi_arm_car2`，允许机器人匿名列目录和下载。
-2. 使用具备该目录列目录和写入权限的 OpenList 账号，并允许用户名/密码自动登录。
+2. 使用具备该目录列目录、**添加离线下载任务**及**创建目录或上传**权限的 OpenList
+   账号，并允许用户名/密码自动登录。离线下载权限位为 `4`，上传为 `8`；现有 `tang`
+   保留“无需密码访问”后合计为 `14`，需要在账号编辑页保存才能生效。
    当前使用已有 `tang` 账号。后续可选择基本路径限定为 `/ELF3/bxi_arm_car2` 的专用账号，
    这是缩小凭据权限的建议，并非运行流水线的前提；发布器不要求站点管理或删除权限。
 3. 在 GitHub 仓库 **Settings → Secrets and variables → Actions → Repository secrets**
@@ -35,27 +43,32 @@ API 目录 `/`，避免将账号基本路径重复拼接。管理员基本路径
 
 ## 发布完成与失败处理
 
-发布器先校验本地 SHA-256，并使用与机器人完全相同的匿名目录请求确认目录可访问，
-再以 `As-Task: true` 上传安装包，避免等待存储完成时触发网关超时。取得任务 ID 后，
-使用同一账号每 3 秒查询上传任务，最多等待 15 分钟；仅任务状态 `2` 视为完成，
-重试中的状态继续等待，取消、终止失败或超时则停止发布。缺少任务 ID 或 HTTP 504
-不会被当作上传成功。任务完成后使用**无登录凭据的公开下载接口**读取整个文件，验证大小和
-SHA-256，并确认匿名目录能列出该包；成功后才上传 `.sha256`。最后验证校验文件，并确认
+发布器先校验本地 SHA-256，并使用与机器人完全相同的匿名目录请求确认目录可访问。
+GitHub 工作流使用 `--source-base-url`，调用站点内置 `SimpleHttp` 后台拉取文件，避免
+安装包经过 ESA 的大文件上传请求。离线下载任务成功后还可能需要转存，不能仅凭任务
+状态判定发布完成；发布器在有界期限内刷新目标目录、确认文件大小，再通过
+**无登录凭据的公开下载接口**读取整个文件，验证 SHA-256，并确认匿名目录能列出该包。
+安装包验证通过后，才开始拉取 `.sha256`。最后验证校验文件，并确认
 同一次匿名目录列表同时包含安装包和校验文件。访客无法列目录或文件被隐藏时，发布失败；
 匿名目录检查不携带需要额外权限的 `refresh` 参数。
 现有机器人目录发现逻辑只显示同时存在安装包与校验文件的版本，因此安装包上传中不会
 成为可安装版本。上传、鉴权或公开下载校验失败会使工作流失败。
 
-同名文件已经存在时，发布器验证其内容；相同则跳过，不同则失败。上传请求设置
-`Overwrite: false`，不会覆盖已发布包。安装包上传失败或未通过校验时，不会发布校验文件。
-校验文件同样等待异步上传任务完成；任务超时后后台可能仍会继续上传安装包，但单独的
-安装包不会进入可安装版本列表。任务接口只查询当前账号自己创建的任务，无需管理员权限。
+同名文件已经存在时，发布器验证其内容；相同则跳过，不同则失败。后台拉取接口没有
+通用禁止覆盖参数，因此源 Release 资产与版本始终绑定同一原构建产物，创建离线任务
+的 POST 不自动重发。安装包拉取失败或未通过校验时，不会发布校验文件。任务超时后
+后台可能仍会继续转存，但单独的安装包不会进入可安装版本列表。任务接口只查询当前
+账号自己创建的任务，无需管理员权限。
+
+本机手工发布仍可省略 `--source-base-url`，使用 `As-Task: true` 的 PUT 上传，并等待
+任务状态 `2` 成功；取消、失败、超时或缺少任务 ID 时停止。PUT 使用 `Overwrite: false`，
+不自动重发，后续沿用相同的匿名完整校验及“校验文件最后发布”顺序。
 下载站 API 不跟随重定向；公开下载只允许 HTTPS，且不会向存储服务或 CDN 传递发布 token。
 
 登录、账号查询、幂等建目录、目录/文件/任务查询以及匿名文件下载遇到 HTTP 429、5xx
 或连接中断时，最多尝试 4 次，依次等待 1、2、4 秒。任务查询的重试和退避仍计入原来的
 15 分钟截止时间。下载重试会从头读取并重新计算哈希；业务鉴权错误、文件大小或哈希
-不符不会重试。PUT 上传结果可能不确定，因此不会自动重复发送；持续网络失败时可在
+不符不会重试。PUT 上传和离线任务创建结果可能不确定，因此不会自动重复发送；持续网络失败时可在
 Actions 仅重跑失败的发布 job，发布器会校验已经存在的文件后继续。
 
 版本包更新 `/opt/bxi/car2`，实机配置、标定和位置记忆仍留在 `/var/lib/bxi/car2`。
@@ -72,6 +85,8 @@ python3 scripts/publish_ota.py \
 
 参考：[OpenList 流式上传实现](https://github.com/OpenListTeam/OpenList/blob/main/server/handles/fsup.go)、
 [OpenList 上传任务接口](https://github.com/OpenListTeam/OpenList/blob/e3c664f/server/handles/task.go)、
+[OpenList 离线下载接口](https://github.com/OpenListTeam/OpenList/blob/e3c664f/server/handles/offline_download.go)、
+[GitHub Release 创建](https://cli.github.com/manual/gh_release_create)、
 [OpenList 路径约束](https://github.com/OpenListTeam/OpenList/blob/main/pkg/utils/path.go)、
 [GitHub Actions Secrets](https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions)、
 [官方 ROS 容器](https://hub.docker.com/_/ros)。

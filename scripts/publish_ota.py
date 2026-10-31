@@ -23,6 +23,7 @@ RETRYABLE_API_REQUESTS = {
     ('POST', '/api/fs/list'),
     ('POST', '/api/fs/get'),
     ('POST', '/api/task/upload/info'),
+    ('POST', '/api/task/offline_download/info'),
 }
 
 
@@ -75,6 +76,19 @@ def absolute_directory(value):
             any(ord(char) < 32 for char in value)):
         raise PublishError('OpenList directories must be absolute paths without traversal')
     return PurePosixPath(value)
+
+
+def source_directory(value):
+    try:
+        parts = parse.urlsplit(value)
+        if (parts.scheme != 'https' or parts.hostname != 'github.com' or
+                parts.port not in (None, 443) or parts.username or parts.password or
+                parts.query or parts.fragment or
+                not re.fullmatch(r'/[^/]+/[^/]+/releases/download/[^/]+/?', parts.path)):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise PublishError('Source URL must be a public HTTPS GitHub Release download directory') from None
+    return value.rstrip('/')
 
 
 class OpenList:
@@ -173,22 +187,27 @@ class OpenList:
             raise PublishError('OTA directory is outside the publisher account base path') from None
         return '/' if str(relative) == '.' else '/' + str(relative)
 
-    def list_files(self, directory, *, authenticated=True):
+    def list_file_info(self, directory, *, authenticated=True, deadline=None):
         # Anonymous discovery must use the robot's exact request. In particular,
         # refresh can require an account permission that guests do not possess.
         payload = {'path': directory}
         if authenticated:
             payload.update(page=1, per_page=0, refresh=True)
-        data = self.api('POST', '/api/fs/list', payload, authenticated=authenticated)
+        data = self.api('POST', '/api/fs/list', payload, authenticated=authenticated,
+                        deadline=deadline)
         if not isinstance(data, dict):
             raise PublishError('OpenList returned an invalid directory listing')
         entries = data.get('content') or []
         if (not isinstance(entries, list) or
                 data.get('total', len(entries)) != len(entries)):
             raise PublishError('OpenList directory listing is incomplete')
-        return {entry['name'] for entry in entries
+        return {entry['name']: entry for entry in entries
                 if isinstance(entry, dict) and isinstance(entry.get('name'), str)
                 and not entry.get('is_dir')}
+
+    def list_files(self, directory, *, authenticated=True, deadline=None):
+        return set(self.list_file_info(directory, authenticated=authenticated,
+                                       deadline=deadline))
 
     def upload(self, file, directory, digest):
         remote = str(PurePosixPath(directory) / file.name)
@@ -207,9 +226,10 @@ class OpenList:
             raise PublishError('OpenList upload returned no task ID')
         self.wait_for_upload(task_id)
 
-    def wait_for_upload(self, task_id):
-        endpoint = '/api/task/upload/info?' + parse.urlencode({'tid': task_id})
-        deadline = time.monotonic() + UPLOAD_TASK_TIMEOUT
+    def wait_for_upload(self, task_id, *, task_type='upload', deadline=None):
+        endpoint = f'/api/task/{task_type}/info?' + parse.urlencode({'tid': task_id})
+        if deadline is None:
+            deadline = time.monotonic() + UPLOAD_TASK_TIMEOUT
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -227,6 +247,43 @@ class OpenList:
                 return
             if state in (4, 7):
                 raise PublishError('OpenList upload task failed or was canceled')
+            time.sleep(min(UPLOAD_POLL_INTERVAL, remaining))
+
+    def pull(self, file, directory, source_base_url):
+        deadline = time.monotonic() + UPLOAD_TASK_TIMEOUT
+        # Offline transfers do not support Overwrite:false. Recheck immediately
+        # before creating the task; publish() verifies any existing file fully.
+        if file.name in self.list_files(directory, deadline=deadline):
+            return
+        data = self.api('POST', '/api/fs/add_offline_download', {
+            'urls': [source_base_url + '/' + parse.quote(file.name, safe='')],
+            'path': directory,
+            'tool': 'SimpleHttp',
+            'delete_policy': 'delete_on_upload_succeed',
+        }, timeout=60, deadline=deadline)
+        if not isinstance(data, dict) or 'tasks' not in data:
+            raise PublishError('OpenList returned an invalid offline download response')
+        tasks = data['tasks']
+        if tasks is None:
+            tasks = []
+        if not isinstance(tasks, list):
+            raise PublishError('OpenList returned invalid offline download tasks')
+        for task in tasks:
+            task_id = task.get('id') if isinstance(task, dict) else None
+            if not isinstance(task_id, str) or not task_id:
+                raise PublishError('OpenList offline download returned no task ID')
+            self.wait_for_upload(task_id, task_type='offline_download', deadline=deadline)
+        # A download task can succeed before its separate transfer finishes.
+        # PutURL may also finish with no task IDs. Neither proves publication:
+        # wait for the exact target and size, then publish() reads and hashes it
+        # anonymously before allowing the checksum task to be created.
+        while True:
+            files = self.list_file_info(directory, deadline=deadline)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PublishError('OpenList offline transfer timed out')
+            if files.get(file.name, {}).get('size') == file.stat().st_size:
+                return
             time.sleep(min(UPLOAD_POLL_INTERVAL, remaining))
 
     def verify_public_file(self, file, public_directory, digest):
@@ -265,7 +322,7 @@ class OpenList:
             return
 
 
-def publish(client, archive, checksum, public_directory):
+def publish(client, archive, checksum, public_directory, *, source_base_url=None):
     if not re.fullmatch(r'car2_v\d{6}(?:-[1-9]\d*)?\.tar\.gz', archive.name):
         raise PublishError('Archive name must be car2_vYYMMDD[-N].tar.gz')
     if checksum.name != archive.name + '.sha256':
@@ -276,6 +333,8 @@ def publish(client, archive, checksum, public_directory):
     expected = f'{digest}  {archive.name}\n'.encode('ascii')
     if checksum.stat().st_size != len(expected) or checksum.read_bytes() != expected:
         raise PublishError('Local checksum does not match the archive')
+    if source_base_url is not None:
+        source_base_url = source_directory(source_base_url)
     checksum_digest = hashlib.sha256(expected).hexdigest()
     public_directory = str(absolute_directory(public_directory))
     directory = client.account_directory(public_directory)
@@ -290,14 +349,20 @@ def publish(client, archive, checksum, public_directory):
     if checksum.name in existing and archive.name not in existing:
         raise PublishError('Published checksum exists without its archive; refusing to replace it')
     if archive.name not in existing:
-        client.upload(archive, directory, digest)
+        if source_base_url is None:
+            client.upload(archive, directory, digest)
+        else:
+            client.pull(archive, directory, source_base_url)
     client.verify_public_file(archive, public_directory, digest)
     if archive.name not in client.list_files(public_directory, authenticated=False):
         raise PublishError('Archive is not visible in the anonymous OTA directory listing')
     if checksum.name not in existing:
         # This is the publication point: robots discover only archive+checksum
         # pairs, and the archive has already passed an anonymous full readback.
-        client.upload(checksum, directory, checksum_digest)
+        if source_base_url is None:
+            client.upload(checksum, directory, checksum_digest)
+        else:
+            client.pull(checksum, directory, source_base_url)
     client.verify_public_file(checksum, public_directory, checksum_digest)
     public_files = client.list_files(public_directory, authenticated=False)
     if not {archive.name, checksum.name}.issubset(public_files):
@@ -311,11 +376,13 @@ def main():
     parser.add_argument('--checksum', type=Path, required=True)
     parser.add_argument('--site', default='https://download.bxirobotics.cn')
     parser.add_argument('--remote-dir', default='/ELF3/bxi_arm_car2', help='Public, site-wide directory')
+    parser.add_argument('--source-base-url', help='Public HTTPS GitHub Release download directory')
     args = parser.parse_args()
     try:
         client = OpenList(args.site)
         client.login(os.environ.get('OTA_USERNAME', ''), os.environ.get('OTA_PASSWORD', ''))
-        publish(client, args.archive, args.checksum, args.remote_dir)
+        publish(client, args.archive, args.checksum, args.remote_dir,
+                source_base_url=args.source_base_url)
     except (PublishError, OSError) as exc:
         print(f'OTA publish failed: {exc}', file=sys.stderr)
         return 1

@@ -9,8 +9,8 @@ ROS 2 Humble 底盘与机械臂控制项目。源码、配置模板、离线测�
 
 1. 使用 Ubuntu 22.04 / ROS Humble 环境编译 x86_64 程序。
 2. 运行控制器离线测试和发布器测试。
-3. 生成 `car2_vYYMMDD-N.tar.gz` 及 SHA-256 校验文件，并保留 Actions 下载产物。
-4. 将安装包上传并校验成功后，最后发布校验文件。
+3. 生成 `car2_vYYMMDD-N.tar.gz` 及 SHA-256 校验文件，保留 Actions 产物并发布到 GitHub Releases。
+4. 下载站后台拉取安装包，通过公开下载校验后，再拉取校验文件完成 OTA 发布。
 
 公开下载目录：<https://download.bxirobotics.cn/ELF3/bxi_arm_car2>。
 工作流文件是 [`.github/workflows/ota.yml`](.github/workflows/ota.yml)，账号权限、
@@ -28,7 +28,7 @@ source /opt/ros/humble/setup.bash
 cmake -S car2 -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build --parallel 4
 ctest --test-dir build --output-on-failure
-python3 -m unittest discover -s scripts -p 'test_publish_ota.py' -v
+python3 -m unittest discover -s scripts -p 'test_publish_*.py' -v
 ```
 
 设备接入见 [App 说明](car2/docs/app_integration.md)，制包及持久配置约定见

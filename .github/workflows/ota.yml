@@ -45,7 +45,7 @@ jobs:
             ros-humble-yaml-cpp-vendor
 
       - name: Test publisher without external services
-        run: python3 -m unittest discover -s scripts -p 'test_publish_ota.py' -v
+        run: python3 -m unittest discover -s scripts -p 'test_publish_*.py' -v
 
       - name: Configure and compile
         run: |
@@ -97,6 +97,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     timeout-minutes: 35
+    permissions:
+      contents: write
     defaults:
       run:
         shell: bash
@@ -106,19 +108,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Download the tested installation archive
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: car2-x86_64-${{ needs.build.outputs.version }}
-          path: dist
-
-      - name: Publish main to the OTA download site
+      - name: Confirm the tested commit is still main
+        id: current
         env:
-          OTA_USERNAME: ${{ secrets.OTA_USERNAME }}
-          OTA_PASSWORD: ${{ secrets.OTA_PASSWORD }}
-          RELEASE_VERSION: ${{ needs.build.outputs.version }}
           GIT_TERMINAL_PROMPT: '0'
-          PYTHONDONTWRITEBYTECODE: '1'
         run: |
           current_main="$(timeout 30 git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" refs/heads/main | cut -f1)"
           if [[ -z "$current_main" ]]; then
@@ -126,10 +119,38 @@ jobs:
             exit 1
           fi
           if [[ "$current_main" != "$GITHUB_SHA" ]]; then
-            echo '::notice::A newer main commit exists; this archive will not replace its OTA release.'
-            exit 0
+            echo '::notice::A newer main commit exists; this archive will not be published.'
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Download the tested installation archive
+        if: steps.current.outputs.publish == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: car2-x86_64-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Publish the immutable source pair to GitHub Releases
+        if: steps.current.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          GIT_TERMINAL_PROMPT: '0'
+        run: bash scripts/publish_github_release.sh
+
+      - name: Publish main to the OTA download site
+        if: steps.current.outputs.publish == 'true'
+        env:
+          OTA_USERNAME: ${{ secrets.OTA_USERNAME }}
+          OTA_PASSWORD: ${{ secrets.OTA_PASSWORD }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+          GIT_TERMINAL_PROMPT: '0'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
           python3 scripts/publish_ota.py \
             --archive "dist/car2_${RELEASE_VERSION}.tar.gz" \
             --checksum "dist/car2_${RELEASE_VERSION}.tar.gz.sha256" \
+            --source-base-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/$RELEASE_VERSION" \
             --remote-dir /ELF3/bxi_arm_car2

@@ -20,10 +20,12 @@ class Site:
     token = 'unit-test-token-not-a-real-credential'
     password = 'unit-test-password-not-a-real-credential'
     public_directory = '/ELF3/bxi_arm_car2'
+    source_directory = 'https://github.com/Luckyt1/bxi_car_v2.0/releases/download/v261030-1001'
 
     def __init__(self):
         self.base_path = self.public_directory
         self.files = {}
+        self.files_after_listing = None
         self.events = []
         self.http_errors = {}
         self.fail_upload = False
@@ -34,6 +36,17 @@ class Site:
         self.task_polls = []
         self.task_info_code = 200
         self.task_id_prefix = 'upload-'
+        self.source_files = {}
+        self.offline_requests = []
+        self.offline_tasks = {}
+        self.offline_task_polls = []
+        self.offline_code = 200
+        self.offline_states = [2]
+        self.offline_response = 'task'
+        self.pending_transfers = []
+        self.transfer_list_delay = 0
+        self.transfer_never_finishes = False
+        self.show_partial_transfer = False
         self.private_downloads = False
         self.public_listing = True
         self.hidden_public_files = set()
@@ -124,7 +137,46 @@ class Site:
                 if authorization != site.token:
                     self.respond({'code': 401})
                     return
-                if self.path.startswith('/api/task/upload/info?'):
+                if self.path == '/api/fs/add_offline_download':
+                    site.offline_requests.append(payload)
+                    if site.offline_code != 200:
+                        self.respond({'code': site.offline_code,
+                                      'message': site.token + site.password})
+                        return
+                    urls = payload.get('urls', [])
+                    name = unquote(urlsplit(urls[0]).path.rsplit('/', 1)[-1]) if urls else ''
+                    expected_path = '/' if site.base_path == site.public_directory else site.public_directory
+                    expected = {'urls': [site.source_directory + '/' + name],
+                                'path': expected_path, 'tool': 'SimpleHttp',
+                                'delete_policy': 'delete_on_upload_succeed'}
+                    if payload != expected or name not in site.source_files:
+                        self.respond({'code': 400, 'message': 'invalid offline request'})
+                        return
+                    task_id = 'offline-' + str(len(site.offline_tasks) + 1)
+                    task = {'name': name, 'body': site.source_files[name],
+                            'states': list(site.offline_states), 'queued': False}
+                    site.offline_tasks[task_id] = task
+                    if site.offline_response in ('empty', 'null'):
+                        site.pending_transfers.append({**task, 'remaining': site.transfer_list_delay})
+                        tasks = [] if site.offline_response == 'empty' else None
+                    else:
+                        tasks = [{}] if site.offline_response == 'missing-id' else [{'id': task_id}]
+                    self.respond({'code': 200, 'data': {'tasks': tasks}})
+                elif self.path.startswith('/api/task/offline_download/info?'):
+                    task_id = parse_qs(urlsplit(self.path).query).get('tid', [''])[0]
+                    task = site.offline_tasks.get(task_id)
+                    if task is None:
+                        self.respond({'code': 404})
+                        return
+                    states = task['states']
+                    state = states.pop(0) if len(states) > 1 else states[0]
+                    site.offline_task_polls.append((task_id, state))
+                    if state == 2 and not task['queued']:
+                        task['queued'] = True
+                        site.pending_transfers.append({**task, 'remaining': site.transfer_list_delay})
+                    self.respond({'code': 200, 'data': {'id': task_id, 'state': state,
+                                                       'progress': 100, 'error': site.password}})
+                elif self.path.startswith('/api/task/upload/info?'):
                     task_id = parse_qs(urlsplit(self.path).query).get('tid', [''])[0]
                     task = site.tasks.get(task_id)
                     if task is None:
@@ -141,11 +193,26 @@ class Site:
                                            'progress': 100, 'status': site.token,
                                            'error': site.password}})
                 elif self.path == '/api/fs/list':
-                    self.respond({'code': site.list_code, 'data': {
+                    for transfer in list(site.pending_transfers):
+                        if site.transfer_never_finishes:
+                            continue
+                        if transfer['remaining'] > 0:
+                            transfer['remaining'] -= 1
+                            if site.show_partial_transfer:
+                                site.files[transfer['name']] = transfer['body'][:len(transfer['body']) // 2]
+                            continue
+                        site.files[transfer['name']] = transfer['body']
+                        site.events.append(('TRANSFER', transfer['name'], None, False))
+                        site.pending_transfers.remove(transfer)
+                    listing = {'code': site.list_code, 'data': {
                         'content': [{'name': name, 'size': len(data), 'is_dir': False}
                                     for name, data in site.files.items()],
                         'total': len(site.files),
-                    }})
+                    }}
+                    if site.files_after_listing is not None:
+                        site.files.update(site.files_after_listing)
+                        site.files_after_listing = None
+                    self.respond(listing)
                 elif self.path == '/api/fs/mkdir':
                     self.respond({'code': 200})
                 else:
@@ -231,15 +298,186 @@ class PublisherTests(unittest.TestCase):
         self.checksum.write_text(f'{digest}  {self.archive.name}\n')
         self.site = Site()
         self.addCleanup(self.site.close)
+        self.site.source_files = {self.archive.name: self.archive.read_bytes(),
+                                  self.checksum.name: self.checksum.read_bytes()}
         self.client = OpenList(self.site.url, allow_local_http=True)
         self.client.login('publisher', self.site.password)
 
-    def run_publish(self):
+    def run_publish(self, source_base_url=None):
         with contextlib.redirect_stdout(io.StringIO()):
-            publish(self.client, self.archive, self.checksum, self.site.public_directory)
+            publish(self.client, self.archive, self.checksum, self.site.public_directory,
+                    source_base_url=source_base_url)
+
+    def run_pull(self):
+        self.run_publish(self.site.source_directory)
 
     def uploads(self):
         return [event[2] for event in self.site.events if event[0] == 'PUT']
+
+    def test_source_waits_for_transfer_and_public_verification_before_checksum(self):
+        self.site.offline_states = [1, 2]
+        self.site.transfer_list_delay = 3
+        self.site.show_partial_transfer = True
+        self.run_pull()
+        self.assertEqual(self.uploads(), [])
+        self.assertEqual([payload['urls'] for payload in self.site.offline_requests],
+                         [[self.site.source_directory + '/' + self.archive.name],
+                          [self.site.source_directory + '/' + self.checksum.name]])
+        self.assertEqual([state for _, state in self.site.offline_task_polls], [1, 2, 1, 2])
+        transfer = next(i for i, event in enumerate(self.site.events)
+                        if event[:2] == ('TRANSFER', self.archive.name))
+        archive_read = next(i for i, event in enumerate(self.site.events)
+                            if event[1] == '/download/' + self.archive.name)
+        creates = [i for i, event in enumerate(self.site.events)
+                   if event[1] == '/api/fs/add_offline_download']
+        self.assertLess(transfer, archive_read)
+        self.assertLess(archive_read, creates[1])
+        self.assertEqual(self.site.files[self.archive.name], self.archive.read_bytes())
+        self.assertEqual(self.site.files[self.checksum.name], self.checksum.read_bytes())
+        for event in self.site.events:
+            if event[1] == '/api/fs/get' or event[1].startswith('/download/'):
+                self.assertFalse(event[3])
+
+    def test_source_direct_puturl_without_tasks_still_waits_for_final_object(self):
+        for response in ('empty', 'null'):
+            with self.subTest(response=response):
+                self.site.files.clear()
+                self.site.offline_requests.clear()
+                self.site.offline_response = response
+                self.site.transfer_list_delay = 2
+                self.run_pull()
+                self.assertEqual(len(self.site.offline_requests), 2)
+                self.assertEqual(self.site.offline_task_polls, [])
+                self.assertIn(self.checksum.name, self.site.files)
+                self.assertEqual(self.uploads(), [])
+
+    def test_source_task_failure_never_starts_checksum(self):
+        for state in (4, 7):
+            with self.subTest(state=state):
+                self.site.offline_requests.clear()
+                self.site.offline_states = [1, state]
+                with self.assertRaisesRegex(PublishError, 'failed or was canceled') as caught:
+                    self.run_pull()
+                self.assertEqual(len(self.site.offline_requests), 1)
+                self.assertNotIn(self.checksum.name, self.site.files)
+                self.assertNotIn(self.site.token, str(caught.exception))
+                self.assertNotIn(self.site.password, str(caught.exception))
+
+    def test_source_download_task_timeout_does_not_start_checksum(self):
+        self.site.offline_states = [1]
+        now = [0]
+        with patch('publish_ota.time') as clock, patch('publish_ota.UPLOAD_TASK_TIMEOUT', 6):
+            clock.monotonic.side_effect = lambda: now[0]
+            clock.sleep.side_effect = lambda delay: now.__setitem__(0, now[0] + delay)
+            with self.assertRaisesRegex(PublishError, 'timed out'):
+                self.run_pull()
+        self.assertEqual(now[0], 6)
+        self.assertEqual(len(self.site.offline_requests), 1)
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_source_transfer_shares_download_deadline(self):
+        self.site.offline_states = [1, 2]
+        self.site.transfer_never_finishes = True
+        now = [0]
+        with patch('publish_ota.time') as clock, patch('publish_ota.UPLOAD_TASK_TIMEOUT', 9):
+            clock.monotonic.side_effect = lambda: now[0]
+            clock.sleep.side_effect = lambda delay: now.__setitem__(0, now[0] + delay)
+            with self.assertRaisesRegex(PublishError, 'timed out'):
+                self.run_pull()
+        self.assertEqual(now[0], 9, 'transfer waiting must not reset the download deadline')
+        self.assertEqual(self.site.offline_task_polls[-1][1], 2)
+        self.assertEqual(len(self.site.offline_requests), 1)
+        self.assertNotIn(self.checksum.name, self.site.files)
+        self.assertFalse(any(event[1] == '/api/fs/get' for event in self.site.events))
+
+    def test_source_permission_denial_stops_without_checksum_or_secrets(self):
+        self.site.offline_code = 403
+        with self.assertRaisesRegex(PublishError, 'code 403') as caught:
+            self.run_pull()
+        self.assertEqual(len(self.site.offline_requests), 1)
+        self.assertNotIn(self.site.token, str(caught.exception))
+        self.assertNotIn(self.site.password, str(caught.exception))
+        self.assertNotIn(self.checksum.name, self.site.files)
+        self.sleep.assert_not_called()
+
+    def test_source_creation_gateway_failure_is_never_retried(self):
+        endpoint = '/api/fs/add_offline_download'
+        self.site.http_errors[('POST', endpoint)] = [504] * 8
+        with self.assertRaisesRegex(PublishError, 'HTTP 504') as caught:
+            self.run_pull()
+        self.assertEqual(sum(event[1] == endpoint for event in self.site.events), 1)
+        self.assertNotIn(self.site.token, str(caught.exception))
+        self.assertNotIn(self.checksum.name, self.site.files)
+        self.sleep.assert_not_called()
+
+    def test_source_task_queries_recover_without_recreating_downloads(self):
+        self.site.http_errors[('POST', '/api/task/offline_download/info')] = [525, None]
+        self.run_pull()
+        self.assertEqual(len(self.site.offline_requests), 2)
+        self.assertIn(self.checksum.name, self.site.files)
+
+    def test_source_corrupt_archive_never_starts_checksum(self):
+        self.site.source_files[self.archive.name] = b'x' * self.archive.stat().st_size
+        with self.assertRaisesRegex(PublishError, 'content mismatch'):
+            self.run_pull()
+        self.assertEqual(len(self.site.offline_requests), 1)
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_source_archive_visibility_is_required_before_checksum_task(self):
+        self.site.hidden_public_files.add(self.archive.name)
+        with self.assertRaisesRegex(PublishError, 'Archive is not visible'):
+            self.run_pull()
+        self.assertEqual(len(self.site.offline_requests), 1)
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_source_repeated_publication_does_not_create_new_tasks(self):
+        self.run_pull()
+        self.run_pull()
+        self.assertEqual(len(self.site.offline_requests), 2)
+        self.assertEqual(len(self.site.offline_task_polls), 2)
+        self.assertEqual(self.uploads(), [])
+
+    def test_source_existing_different_archive_is_not_replaced(self):
+        self.site.files[self.archive.name] = b'x' * self.archive.stat().st_size
+        with self.assertRaisesRegex(PublishError, 'content mismatch'):
+            self.run_pull()
+        self.assertEqual(self.site.offline_requests, [])
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_source_existing_verified_archive_only_starts_checksum_task(self):
+        self.site.files[self.archive.name] = self.archive.read_bytes()
+        self.run_pull()
+        self.assertEqual([payload['urls'] for payload in self.site.offline_requests],
+                         [[self.site.source_directory + '/' + self.checksum.name]])
+
+    def test_source_rechecks_for_file_created_after_initial_listing(self):
+        self.site.files_after_listing = {self.archive.name: b'x' * self.archive.stat().st_size}
+        with self.assertRaisesRegex(PublishError, 'content mismatch'):
+            self.run_pull()
+        self.assertEqual(self.site.offline_requests, [])
+        self.assertNotIn(self.checksum.name, self.site.files)
+
+    def test_source_rejects_nonpublic_or_credential_urls_before_remote_writes(self):
+        invalid = ['http://github.com/a/b/releases/download/tag',
+                   'https://user:secret@github.com/a/b/releases/download/tag',
+                   self.site.source_directory + '?secret=secret',
+                   self.site.source_directory + '#secret',
+                   'https://other.invalid/a/b/releases/download/tag',
+                   'https://github.com/a/b/actions/artifacts/123']
+        for url in invalid:
+            with self.subTest(url=url), self.assertRaisesRegex(PublishError, 'Source URL') as caught:
+                self.run_publish(url)
+            self.assertNotIn('secret', str(caught.exception))
+        self.assertEqual(self.site.offline_requests, [])
+        self.assertEqual(self.uploads(), [])
+
+    def test_source_malformed_task_id_cannot_start_checksum(self):
+        self.site.offline_response = 'missing-id'
+        with self.assertRaisesRegex(PublishError, 'no task ID'):
+            self.run_pull()
+        self.assertEqual(len(self.site.offline_requests), 1)
+        self.assertEqual(self.site.offline_task_polls, [])
+        self.assertNotIn(self.checksum.name, self.site.files)
 
     def test_archive_is_publicly_verified_before_checksum_is_uploaded(self):
         self.run_publish()
